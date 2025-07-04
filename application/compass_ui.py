@@ -79,21 +79,23 @@ class CompassUI(QWidget):
 
     def stop_plotting(self):
         if hasattr(self, 'core'):
+            self.core.data_collection_started = False
             self.core.disconnect_serial()
 
         if self.cleanup_timer and self.cleanup_timer.isActive():
             self.cleanup_timer.stop()
 
-        self.cleanup_timer = QTimer(self)
-        self.cleanup_timer.setSingleShot(True)
-        self.cleanup_timer.timeout.connect(self.clear_core)
-        self.cleanup_timer.start(self.core.CALIBRATION_DURATION * 1000)
+        # 立即清理 core 和 plotter，不需要等待 50 秒
+        self.clear_core()
 
         self.stop_button.setEnabled(False)
         self.start_button.setEnabled(True)
 
     def clear_core(self):
+        if hasattr(self, 'plotter'):
+            # 清理 matplotlib figure 防止窗口卡住
+            self.plotter.fig = None
+            del self.plotter
+
         if hasattr(self, 'core'):
             del self.core
-        self.stop_button.setEnabled(False)
-        self.start_button.setEnabled(True)

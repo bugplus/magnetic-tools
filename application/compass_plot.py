@@ -11,14 +11,17 @@ class CompassPlot:
         self.core = core
         self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(1, 3, figsize=(18, 6))
 
-        # 初始化图形元素
+        # Initialize plot elements
         self.line1, = self.ax1.plot([], [], 'r.', markersize=3)
         self.line2, = self.ax2.plot([], [], 'g.', markersize=3)
         self.line3, = self.ax3.plot([], [], 'b.', markersize=3)
+        self.center_point1, = self.ax1.plot([], [], 'ko', markersize=5)  # Center point for raw data
+        self.center_point2, = self.ax2.plot([], [], 'ko', markersize=5)  # Center point for scaled data
+        self.center_point3, = self.ax3.plot([], [], 'ko', markersize=5)  # Center point for calibrated data
 
         self.init_axes()
 
-        # 启动动画
+        # Start animation
         self.ani = FuncAnimation(
             self.fig,
             self.update,
@@ -32,7 +35,7 @@ class CompassPlot:
         plt.show()
 
     def init_axes(self):
-        # 原始数据图
+        # Raw Data plot
         self.ax1.set_title("Raw Magnetometer X-Y Data\n(Collecting for Calibration)")
         self.ax1.set_xlabel("mag_x")
         self.ax1.set_ylabel("mag_y")
@@ -43,7 +46,7 @@ class CompassPlot:
         self.ax1.set_xlim(-300, 300)
         self.ax1.set_ylim(-300, 300)
 
-        # 缩放后
+        # Scaled Data plot
         self.ax2.set_title("After Scaling Only\n(Scale: x=?, y=?)")
         self.ax2.set_xlabel("mag_x (scaled)")
         self.ax2.set_ylabel("mag_y (scaled)")
@@ -52,7 +55,7 @@ class CompassPlot:
         self.ax2.grid(True)
         self.ax2.axis('equal')
 
-        # 校准后
+        # Fully Calibrated Data plot
         self.ax3.set_title("Fully Calibrated\n(Offset: (0.0, 0.0), Scale: x=1.000, y=1.000)")
         self.ax3.set_xlabel("mag_x (calibrated)")
         self.ax3.set_ylabel("mag_y (calibrated)")
@@ -125,8 +128,10 @@ class CompassPlot:
                 self.line2.set_data(scaled_xs, scaled_ys)
                 self.ax2.set_title(f"After Scaling Only\n(Scale: x={self.core.scale_x:.3f}, y={self.core.scale_y:.3f})")
 
+                # Calculate and plot center point for scaled data
                 self.core.center_x = (max(scaled_xs) + min(scaled_xs)) / 2
                 self.core.center_y = (max(scaled_ys) + min(scaled_ys)) / 2
+                self.center_point2.set_data([self.core.center_x], [self.core.center_y])
 
                 calibrated_xs = scaled_xs - self.core.center_x
                 calibrated_ys = scaled_ys - self.core.center_y
@@ -135,6 +140,14 @@ class CompassPlot:
                 self.ax3.set_title(f"Fully Calibrated\n(Offset: ({self.core.center_x:.1f}, {self.core.center_y:.1f}), "
                                     f"Scale: x={self.core.scale_x:.3f}, y={self.core.scale_y:.3f})")
 
+                # Plot center point for calibrated data
+                self.center_point3.set_data([0], [0])  # Center point for calibrated data is (0,0)
+
+                # Calculate and plot center point for raw data
+                raw_center_x = (x_max + x_min) / 2
+                raw_center_y = (y_max + y_min) / 2
+                self.center_point1.set_data([raw_center_x], [raw_center_y])
+
                 for ax in [self.ax1, self.ax2, self.ax3]:
                     ax.set_xlim(self.core.x_range_final)
                     ax.set_ylim(self.core.y_range_final)
@@ -142,4 +155,4 @@ class CompassPlot:
             self.core.calibration_done = True
             print("[INFO] 校准完成，已切换至校准图")
 
-        return self.line1, self.line2, self.line3
+        return self.line1, self.line2, self.line3, self.center_point1, self.center_point2, self.center_point3

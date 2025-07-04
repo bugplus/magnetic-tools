@@ -82,5 +82,5 @@ Feel free to open an issue or submit a pull request!
 
 If you have any questions or need help integrating this into your project, feel free to reach out at:
 
-📧 Email: your_email@example.com  
-🐙 GitHub: https://github.com/yourname
+📧 Email: isbitnet@gmail.com  
+🐙 GitHub: https://github.com/bugplus

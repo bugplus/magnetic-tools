@@ -1,4 +1,5 @@
-# main.py
+# 文件名: main.py
+# 说明: 程序的入口点，负责启动 CompassUI 界面。
 
 import sys
 from PyQt5.QtWidgets import QApplication

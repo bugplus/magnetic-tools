@@ -1,86 +1,27 @@
-# Magnetometer Compass Viewer with Calibration GUI
+# Compass Viewer with PyQt5 and Matplotlib
 
-A PyQt5-based GUI application for visualizing and calibrating magnetometer data from a serial port.
+这是一个基于 PyQt5 和 Matplotlib 的指南针数据可视化工具。它通过串口接收磁场数据，并实时绘制原始数据、校准后的数据以及最终的校准结果。
 
-This software reads raw magnetic field data from a sensor, plots it in real-time, and performs automatic calibration to center and scale the data after a fixed duration.
+## 功能特点
+- 实时接收串口数据，绘制磁场数据的 X-Y 图。
+- 自动校准功能，将椭圆数据校准为圆形。
+- 支持用户选择串口和波特率。
+- 数据动态更新，支持长时间运行。
 
-## 🧩 Features
+## 项目结构
+- `main.py`：程序的入口点，负责启动应用程序。
+- `compass_ui.py`：包含 `CompassUI` 类，负责用户界面的创建和控制。
+- `compass_app.py`：包含 `CompassApp` 类，负责串口通信和数据处理。
+- `utils.py`：（可选）用于存放通用工具函数。
 
-- ✅ Real-time plotting of X-Y magnetometer data
-- ✅ Auto-calibration after configurable time (default: 50s)
-- ✅ Three matplotlib subplots:
-  - Raw Data
-  - Scaled Data
-  - Fully Calibrated Data
-- ✅ Serial port & baud rate selection via PyQt5 UI
-- ✅ Start/Stop control for data collection
-- ✅ Easy configuration via config.py
+## 环境依赖
+- Python 3.8+
+- PyQt5
+- Matplotlib
+- NumPy
+- PySerial
 
-## 📁 File Structure
-
-compassProject/
-├── config.py              # Configuration parameters
-├── compass_core.py        # Core logic: serial handling & calibration
-├── compass_plot.py        # Plotting logic using matplotlib
-├── compass_ui.py          # PyQt5 UI interface
-├── main.py                # Program entry point
-└── README.md              # This file
-
-## ⚙️ Requirements
-
-Install dependencies via pip:
-
-pip install pyserial numpy matplotlib PyQt5
-
-## ▶️ How to Run
-
-1. Connect your magnetometer device via USB/UART.
-2. Clone the repository:
-
-git clone https://github.com/yourname/your-repo-name.git
-cd your-repo-name
-
-3. Install dependencies (if not already):
-
-pip install -r requirements.txt
-
-💡 If you don't have a `requirements.txt`, create one easily:
-
-pip freeze > requirements.txt
-
-4. Run the app:
-
-python main.py
-
-5. In the GUI:
-   - Select the correct COM port
-   - Choose the baud rate
-   - Click "Start" to begin collecting data
-   - After calibration time, the system will auto-stop and display calibrated results
-
-## 💡 Notes
-
-- Ensure the selected serial port is available and not used by another program.
-- The sensor should output data in the format like:
-  mag_x=123, mag_y=456
-- You can adjust behavior in config.py:
-  - PORT: Default serial port
-  - BAUD_RATE: Communication speed
-  - CALIBRATION_DURATION: Time (seconds) before calibration
-  - MAX_POINTS: Max number of data points stored
-
-## 🤝 Contributing
-
-Contributions are welcome! Whether you want to:
-- Add new features (e.g., save plots, export data)
-- Improve the UI
-- Fix bugs or enhance documentation
-
-Feel free to open an issue or submit a pull request!
-
-## 📬 Contact
-
-If you have any questions or need help integrating this into your project, feel free to reach out at:
-
-📧 Email: isbitnet@gmail.com  
-🐙 GitHub: https://github.com/bugplus
+## 安装依赖
+在项目根目录下运行以下命令以安装所有依赖：
+```bash
+pip install pyqt5 matplotlib numpy pyserial

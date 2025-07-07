@@ -1,1 +1,1 @@
-pyinstaller --onefile --windowed --icon=.\ico\tools.ico main.py
+pyinstaller --onefile --icon=.\ico\tools.ico main.py

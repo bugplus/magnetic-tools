@@ -7,6 +7,7 @@ from PyQt5.QtCore import QTimer
 from compass_app import CompassApp
 from serial.tools import list_ports
 import time
+from config import CALIBRATION_DURATION  # 从 config.py 导入 CALIBRATION_DURATION
 
 class CompassUI(QWidget):
     def __init__(self):
@@ -16,8 +17,8 @@ class CompassUI(QWidget):
         self.baud_combo = QComboBox()
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
-        self.stop_button.setEnabled(False)
-        self.cleanup_timer = None
+        self.stop_button.setEnabled(False)  # 初始化时禁用Stop按钮
+        self.cleanup_timer = QTimer(self)
         self.app_instance = None
 
         self.initUI()
@@ -43,13 +44,13 @@ class CompassUI(QWidget):
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
 
-        self.start_button.clicked.connect(self.start_plotting)
-        self.stop_button.clicked.connect(self.stop_plotting)
-
         layout.addLayout(port_layout)
         layout.addLayout(baud_layout)
         layout.addLayout(button_layout)
         self.setLayout(layout)
+
+        self.start_button.clicked.connect(self.start_plotting)
+        self.stop_button.clicked.connect(self.stop_plotting)
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -61,34 +62,41 @@ class CompassUI(QWidget):
         port = self.port_combo.currentText()
         baud_rate = int(self.baud_combo.currentText())
 
-        if self.cleanup_timer and self.cleanup_timer.isActive():
+        if self.cleanup_timer.isActive():
             self.cleanup_timer.stop()
 
         if self.app_instance:
             self.app_instance.stop_serial()
             del self.app_instance
 
-        self.app_instance = CompassApp(port, baud_rate)
+        self.app_instance = CompassApp(port, baud_rate, self)  # 传递UI实例
         self.app_instance.data_collection_started = True
         self.app_instance.start_time = time.time()
 
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
+        self.start_button.setEnabled(False)  # 禁用Start按钮
+        self.stop_button.setEnabled(True)   # 启用Stop按钮
 
-        self.cleanup_timer = QTimer(self)
-        self.cleanup_timer.setSingleShot(True)
-        self.cleanup_timer.timeout.connect(self.stop_plotting)
-        self.cleanup_timer.start(60 * 1000)
+        self.cleanup_timer.timeout.connect(self.on_timeout)  # 连接计时器到超时处理方法
+        self.cleanup_timer.start(CALIBRATION_DURATION * 1000)  # 设置计时器时间
 
     def stop_plotting(self):
         if self.app_instance:
+            self.app_instance.stop_data_collection()
             self.app_instance.stop_serial()
             self.app_instance.calibration_done = True
             self.app_instance.calibrate_data()
-            print("[INFO] 串口已暂停")
 
+        self.stop_button.setEnabled(False)  # 禁用Stop按钮
+        self.start_button.setEnabled(True)  # 启用Start按钮
+
+        if self.cleanup_timer.isActive():
+            self.cleanup_timer.stop()
+
+    def on_timeout(self):
+        if self.app_instance:
+            self.app_instance.stop_data_collection()
+        self.stop_plotting()
+
+    def update_buttons(self):
         self.stop_button.setEnabled(False)
         self.start_button.setEnabled(True)
-
-        if self.cleanup_timer and self.cleanup_timer.isActive():
-            self.cleanup_timer.stop()

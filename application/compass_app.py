@@ -7,12 +7,13 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from config import PORT, BAUD_RATE, TIMEOUT, UPDATE_INTERVAL, MAX_POINTS, CALIBRATION_DURATION, TOLERANCE_THRESHOLD
+from config import PORT, BAUD_RATE, TIMEOUT, UPDATE_INTERVAL, MAX_POINTS, CALIBRATION_DURATION
 
 class CompassApp:
-    def __init__(self, port, baud_rate):
+    def __init__(self, port, baud_rate, ui_instance=None):
         self.port = port
         self.baud_rate = baud_rate
+        self.ui_instance = ui_instance
         self.raw_data = []
         self.ser = None
         self.calibration_done = False
@@ -154,9 +155,12 @@ class CompassApp:
             self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
             self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
 
-            self.ax2.plot(self.center_x, self.center_y, 'ro')
+            self.ax2.plot(self.center_x, self.center_y, 'ro')  # 修正后的代码
             self.ax3.plot(0, 0, 'ro')
             self.ax1.plot(self.center_x, self.center_y, 'ro')
+
+    def stop_data_collection(self):
+        self.data_collection_started = False
 
     def stop_serial(self):
         if self.ser and self.ser.is_open:

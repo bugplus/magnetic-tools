@@ -1,4 +1,4 @@
-# 文件名: compass_app.py
+# compass_app.py
 # 说明: 包含 CompassApp 类，负责串口通信、数据处理和绘图。
 
 import serial
@@ -7,6 +7,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import json
 from config import PORT, BAUD_RATE, TIMEOUT, UPDATE_INTERVAL, MAX_POINTS, CALIBRATION_DURATION
 
 class CompassApp:
@@ -85,6 +86,7 @@ class CompassApp:
                                 self.raw_data.pop(0)
 
                             if self.data_collection_started and (current_time - self.start_time <= CALIBRATION_DURATION):
+                                # 只有在未完成校准时才打印接收到的数据
                                 print(f"Received Data: mag_x={x}, mag_y={y}")
 
                             if not self.data_collection_started:
@@ -109,7 +111,6 @@ class CompassApp:
         if self.data_collection_started and not self.calibration_done and (current_time - self.start_time > CALIBRATION_DURATION):
             self.calibrate_data()
             self.calibration_done = True
-            print("[INFO] 校准完成，已切换至校准图")
 
         return self.line1, self.line2, self.line3
 
@@ -155,9 +156,36 @@ class CompassApp:
             self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
             self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
 
-            self.ax2.plot(self.center_x, self.center_y, 'ro')  # 修正后的代码
+            self.ax2.plot(self.center_x, self.center_y, 'ro')
             self.ax3.plot(0, 0, 'ro')
             self.ax1.plot(self.center_x, self.center_y, 'ro')
+
+            self.save_calibration_params()
+
+    def save_calibration_params(self, filename='calibration_params.json'):
+        params = {
+            'center_x': self.center_x,
+            'center_y': self.center_y,
+            'scale_x': self.scale_x,
+            'scale_y': self.scale_y
+        }
+        with open(filename, 'w') as f:
+            json.dump(params, f)
+        print(f"校准参数已保存到 {filename}")
+
+    def load_calibration_params(self, filename='calibration_params.json'):
+        try:
+            with open(filename, 'r') as f:
+                params = json.load(f)
+            self.center_x = params['center_x']
+            self.center_y = params['center_y']
+            self.scale_x = params['scale_x']
+            self.scale_y = params['scale_y']
+            print(f"校准参数已从 {filename} 加载")
+        except FileNotFoundError:
+            print(f"未找到文件 {filename}，将使用默认参数")
+        except json.JSONDecodeError:
+            print(f"文件 {filename} 格式错误，将使用默认参数")
 
     def stop_data_collection(self):
         self.data_collection_started = False
@@ -165,4 +193,3 @@ class CompassApp:
     def stop_serial(self):
         if self.ser and self.ser.is_open:
             self.ser.close()
-            print("[INFO] 串口已关闭")

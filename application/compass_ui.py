@@ -13,7 +13,7 @@ class CompassUI(QWidget):
         self.setWindowTitle("Compass Viewer with Control Panel")
         self.port_combo = QComboBox()
         self.baud_combo = QComboBox()
-        self.start_button = QPushButton("Start")
+        self.start_button = QPushButton("Calibration")  # 修改按钮名字为 Calibration
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.cleanup_timer = None

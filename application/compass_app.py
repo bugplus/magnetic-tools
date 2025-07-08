@@ -141,6 +141,18 @@ class CompassApp:
             self.ax3.plot(0, 0, 'ro')
             self.ax1.plot(self.center_x, self.center_y, 'ro')
 
+    def get_calibrated_data(self):
+        if self.calibration_done:
+            xs = np.array([x[0] for x in self.raw_data])
+            ys = np.array([y[1] for y in self.raw_data])
+            scaled_xs = xs * self.scale_x
+            scaled_ys = ys * self.scale_y
+            calibrated_xs = scaled_xs - self.center_x
+            calibrated_ys = scaled_ys - self.center_y
+            return list(zip(calibrated_xs, calibrated_ys))
+        else:
+            return []
+
     def stop_serial(self):
         if self.ser and self.ser.is_open:
             self.ser.close()

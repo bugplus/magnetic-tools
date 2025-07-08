@@ -1,6 +1,6 @@
 # compass_ui.py
 import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QMessageBox
 from PyQt5.QtCore import QTimer
 import time
 from serial.tools import list_ports
@@ -13,11 +13,12 @@ class CompassUI(QWidget):
         self.setWindowTitle("Compass Viewer with Control Panel")
         self.port_combo = QComboBox()
         self.baud_combo = QComboBox()
-        self.start_button = QPushButton("Calibration")  # 修改按钮名字为 Calibration
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.setEnabled(False)
-        self.cleanup_timer = None
+        self.calibration_button = QPushButton("Calibration")  # 校准按钮
+        self.run_button = QPushButton("Run")  # 运行算法按钮
+        self.stop_button = QPushButton("Stop")  # 停止按钮
+        self.stop_button.setEnabled(False)  # 初始状态禁用 Stop 按钮
         self.app_instance = None
+        self.is_calibrated = False  # 标记是否完成校准
 
         self.initUI()
         self.refresh_ports()
@@ -36,11 +37,13 @@ class CompassUI(QWidget):
         baud_layout.addWidget(self.baud_combo)
 
         button_layout = QHBoxLayout()
-        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.calibration_button)
+        button_layout.addWidget(self.run_button)
         button_layout.addWidget(self.stop_button)
 
-        self.start_button.clicked.connect(self.start_plotting)
-        self.stop_button.clicked.connect(self.stop_plotting)
+        self.calibration_button.clicked.connect(self.start_calibration)
+        self.run_button.clicked.connect(self.start_running)
+        self.stop_button.clicked.connect(self.stop_operation)
 
         layout.addLayout(port_layout)
         layout.addLayout(baud_layout)
@@ -53,15 +56,13 @@ class CompassUI(QWidget):
         for port in ports:
             self.port_combo.addItem(port.device)
 
-    def start_plotting(self):
+    def start_calibration(self):
+        if self.app_instance is not None:
+            self.stop_operation()  # 如果已经有实例在运行，先停止
+            del self.app_instance
+
         port = self.port_combo.currentText()
         baud_rate = int(self.baud_combo.currentText())
-
-        if self.cleanup_timer and self.cleanup_timer.isActive():
-            self.cleanup_timer.stop()
-
-        if self.app_instance is not None:
-            del self.app_instance
 
         self.app_instance = CompassApp()
         self.app_instance.port = port
@@ -71,33 +72,74 @@ class CompassUI(QWidget):
         self.app_instance.data_collection_started = True
         self.app_instance.start_time = time.time()
 
-        self.start_button.setEnabled(False)
+        self.calibration_button.setEnabled(False)
+        self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
-        self.cleanup_timer = QTimer(self)
-        self.cleanup_timer.setSingleShot(True)
-        self.cleanup_timer.timeout.connect(self.stop_plotting)
-        self.cleanup_timer.start(config.CALIBRATION_DURATION * 1000)
+        # 启动一个定时器，用于在指定时间后完成校准
+        self.calibration_timer = QTimer(self)
+        self.calibration_timer.setSingleShot(True)
+        self.calibration_timer.timeout.connect(self.complete_calibration)
+        self.calibration_timer.start(config.CALIBRATION_DURATION * 1000)
 
-    def stop_plotting(self):
+    def complete_calibration(self):
+        if self.app_instance is not None:
+            self.app_instance.calibrate_data()
+            self.is_calibrated = True
+            self.run_button.setEnabled(True)  # 校准完成后启用 Run 按钮
+            self.calibration_button.setEnabled(False)  # 禁用 Calibration 按钮
+            self.stop_button.setEnabled(False)  # 禁用 Stop 按钮
+            QMessageBox.information(self, "Calibration Complete", "Calibration is complete. You can now run the algorithm.")
+        else:
+            QMessageBox.warning(self, "Calibration Failed", "Calibration failed. Please try again.")
+
+    def start_running(self):
+        if not self.is_calibrated:
+            QMessageBox.warning(self, "Warning", "Calibration is required before running the algorithm.")
+            return
+
+        self.run_button.setEnabled(False)
+        self.calibration_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+        # 模拟算法运行
+        self.process_data()
+
+    def process_data(self):
+        if self.app_instance is not None:
+            calibrated_data = self.app_instance.get_calibrated_data()
+            result = self.run_algorithm(calibrated_data)
+            QMessageBox.information(self, "Algorithm Result", f"Processed Data:\n{result}")
+        else:
+            QMessageBox.warning(self, "Warning", "No data available to process.")
+
+        self.stop_operation()
+
+    def run_algorithm(self, data):
+        # 示例算法：计算平均值
+        if not data:
+            return "No data available."
+        xs = [x[0] for x in data]
+        ys = [x[1] for x in data]
+        avg_x = sum(xs) / len(xs)
+        avg_y = sum(ys) / len(ys)
+        return f"Average X: {avg_x:.2f}, Average Y: {avg_y:.2f}"
+
+    def stop_operation(self):
         if self.app_instance is not None:
             self.app_instance.stop_serial()
-            self.app_instance.calibration_done = True
-            self.app_instance.calibrate_data()
-            print("[INFO] 串口已暂停")
+            self.app_instance.calibration_done = False
+            self.app_instance.data_collection_started = False
 
+        self.calibration_button.setEnabled(True)
+        self.run_button.setEnabled(self.is_calibrated)  # 如果已经校准，则启用 Run 按钮
         self.stop_button.setEnabled(False)
-        self.start_button.setEnabled(True)
-        print("[INFO] Buttons updated: Stop disabled, Start enabled immediately.")
 
-        if self.cleanup_timer and self.cleanup_timer.isActive():
-            self.cleanup_timer.stop()
+        if hasattr(self, 'calibration_timer') and self.calibration_timer.isActive():
+            self.calibration_timer.stop()
 
     def clear_app_instance(self):
         if self.app_instance is not None:
             del self.app_instance
+            self.app_instance = None
             print("[INFO] 数据实例已释放")
-
-        self.stop_button.setEnabled(False)
-        self.start_button.setEnabled(True)
-        print("[INFO] Buttons updated: Stop disabled, Start enabled after timer.")

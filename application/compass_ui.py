@@ -86,9 +86,9 @@ class CompassUI(QWidget):
         if self.app_instance is not None:
             self.app_instance.calibrate_data()
             self.is_calibrated = True
+            self.calibration_button.setEnabled(True)  # 校准完成后启用 Calibration 按钮
             self.run_button.setEnabled(True)  # 校准完成后启用 Run 按钮
-            self.calibration_button.setEnabled(False)  # 禁用 Calibration 按钮
-            self.stop_button.setEnabled(False)  # 禁用 Stop 按钮
+            self.stop_button.setEnabled(False)  # 校准完成后禁用 Stop 按钮
             QMessageBox.information(self, "Calibration Complete", "Calibration is complete. You can now run the algorithm.")
         else:
             QMessageBox.warning(self, "Calibration Failed", "Calibration failed. Please try again.")

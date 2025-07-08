@@ -1,13 +1,11 @@
 # compass_ui.py
-# 说明: 包含 CompassUI 类，负责创建用户界面和控制程序的启动/停止。
-
 import sys
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox
 from PyQt5.QtCore import QTimer
-from compass_app import CompassApp
-from serial.tools import list_ports
 import time
-from config import CALIBRATION_DURATION, BAUD_RATE_OPTIONS, DEFAULT_BAUD_RATE
+from serial.tools import list_ports
+from compass_app import CompassApp
+import config
 
 class CompassUI(QWidget):
     def __init__(self):
@@ -15,11 +13,10 @@ class CompassUI(QWidget):
         self.setWindowTitle("Compass Viewer with Control Panel")
         self.port_combo = QComboBox()
         self.baud_combo = QComboBox()
-        self.calibration_button = QPushButton("Calibration")
-        self.run_button = QPushButton("Run")
+        self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
-        self.stop_button.setEnabled(False)  # 初始化时禁用Stop按钮
-        self.cleanup_timer = QTimer(self)
+        self.stop_button.setEnabled(False)
+        self.cleanup_timer = None
         self.app_instance = None
 
         self.initUI()
@@ -28,32 +25,27 @@ class CompassUI(QWidget):
     def initUI(self):
         layout = QVBoxLayout()
 
-        # Serial Port Selection
         port_layout = QHBoxLayout()
         port_layout.addWidget(QLabel("Serial Port:"))
         port_layout.addWidget(self.port_combo)
 
-        # Baud Rate Selection
         baud_layout = QHBoxLayout()
         baud_layout.addWidget(QLabel("Baud Rate:"))
-        self.baud_combo.addItems(BAUD_RATE_OPTIONS)
-        self.baud_combo.setCurrentText(DEFAULT_BAUD_RATE)
+        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.baud_combo.setCurrentText("115200")
         baud_layout.addWidget(self.baud_combo)
 
-        # Buttons
         button_layout = QHBoxLayout()
-        button_layout.addWidget(self.calibration_button)
-        button_layout.addWidget(self.run_button)
+        button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
+
+        self.start_button.clicked.connect(self.start_plotting)
+        self.stop_button.clicked.connect(self.stop_plotting)
 
         layout.addLayout(port_layout)
         layout.addLayout(baud_layout)
         layout.addLayout(button_layout)
         self.setLayout(layout)
-
-        self.calibration_button.clicked.connect(self.start_calibration)
-        self.run_button.clicked.connect(self.run_calibration)
-        self.stop_button.clicked.connect(self.stop_calibration)
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -61,62 +53,51 @@ class CompassUI(QWidget):
         for port in ports:
             self.port_combo.addItem(port.device)
 
-    def start_calibration(self):
+    def start_plotting(self):
         port = self.port_combo.currentText()
         baud_rate = int(self.baud_combo.currentText())
 
-        if self.cleanup_timer.isActive():
+        if self.cleanup_timer and self.cleanup_timer.isActive():
             self.cleanup_timer.stop()
 
-        if self.app_instance:
-            self.app_instance.stop_serial()
+        if self.app_instance is not None:
             del self.app_instance
 
-        self.app_instance = CompassApp(port, baud_rate, self)  # 传递UI实例
+        self.app_instance = CompassApp()
+        self.app_instance.port = port
+        self.app_instance.baud_rate = baud_rate
+        self.app_instance.connect_serial()
+
         self.app_instance.data_collection_started = True
         self.app_instance.start_time = time.time()
 
-        self.calibration_button.setEnabled(False)  # 禁用Calibration按钮
-        self.run_button.setEnabled(True)   # 启用Run按钮
-        self.stop_button.setEnabled(True)   # 启用Stop按钮
-
-        self.cleanup_timer.timeout.connect(self.on_timeout)  # 连接计时器到超时处理方法
-        self.cleanup_timer.start(CALIBRATION_DURATION * 1000)  # 设置计时器时间
-
-    def run_calibration(self):
-        if self.app_instance:
-            new_data = self.app_instance.get_new_data()  # 获取新数据
-            calibrated_data = self.app_instance.process_new_data(new_data)  # 处理新数据
-            self.app_instance.plot_data(new_data, calibrated_data)  # 绘制数据
-
-        self.run_button.setEnabled(False)
-        self.calibration_button.setEnabled(True)
+        self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
-    def stop_calibration(self):
-        if self.app_instance:
+        self.cleanup_timer = QTimer(self)
+        self.cleanup_timer.setSingleShot(True)
+        self.cleanup_timer.timeout.connect(self.stop_plotting)
+        self.cleanup_timer.start(config.CALIBRATION_DURATION * 1000)
+
+    def stop_plotting(self):
+        if self.app_instance is not None:
             self.app_instance.stop_serial()
             self.app_instance.calibration_done = True
             self.app_instance.calibrate_data()
+            print("[INFO] 串口已暂停")
 
-        self.stop_button.setEnabled(False)
-        self.calibration_button.setEnabled(True)
-
-    def on_timeout(self):
-        if self.app_instance:
-            self.app_instance.stop_data_collection()
-        self.stop_plotting()
-
-    def stop_plotting(self):
-        if self.app_instance:
-            self.app_instance.stop_serial()
-        self.run_button.setEnabled(False)
-        self.calibration_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-
-        if self.cleanup_timer.isActive():
-            self.cleanup_timer.stop()
-
-    def update_buttons(self):
         self.stop_button.setEnabled(False)
         self.start_button.setEnabled(True)
+        print("[INFO] Buttons updated: Stop disabled, Start enabled immediately.")
+
+        if self.cleanup_timer and self.cleanup_timer.isActive():
+            self.cleanup_timer.stop()
+
+    def clear_app_instance(self):
+        if self.app_instance is not None:
+            del self.app_instance
+            print("[INFO] 数据实例已释放")
+
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+        print("[INFO] Buttons updated: Stop disabled, Start enabled after timer.")

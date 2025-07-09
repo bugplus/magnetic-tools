@@ -28,7 +28,7 @@ class CompassApp:
         try:
             self.ser = serial.Serial(self.port, self.baud_rate, timeout=config.TIMEOUT)
             print(f"[INFO] 已连接到串口 {self.port}")
-        except Exception as e:
+        except serial.SerialException as e:
             print(f"[ERROR] 无法打开串口 {self.port}，错误：{e}")
 
     def init_plot(self):
@@ -104,6 +104,22 @@ class CompassApp:
             self.calibration_done = True
             print("[INFO] 校准完成，已切换至校准图")
 
+        if self.calibration_done:
+            xs = np.array([x[0] for x in self.raw_data])
+            ys = np.array([y[1] for y in self.raw_data])
+            scaled_xs = xs * self.scale_x
+            scaled_ys = ys * self.scale_y
+            calibrated_xs = scaled_xs - self.center_x
+            calibrated_ys = scaled_ys - self.center_y
+            self.line2.set_data(scaled_xs, scaled_ys)
+            self.line3.set_data(calibrated_xs, calibrated_ys)
+            self.ax2.set_xlim(min(scaled_xs) - 50, max(scaled_xs) + 50)
+            self.ax2.set_ylim(min(scaled_ys) - 50, max(scaled_ys) + 50)
+            self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
+            self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
+            self.ax2.plot(self.center_x, self.center_y, 'ro')  # 显示圆心
+            self.ax3.plot(0, 0, 'ro')  # 显示归零后的圆心
+
         return self.line1, self.line2, self.line3
 
     def calibrate_data(self):
@@ -112,9 +128,6 @@ class CompassApp:
             ys = np.array([y[1] for y in self.raw_data])
             x_min, x_max = min(xs), max(xs)
             y_min, y_max = min(ys), max(ys)
-            margin = 50
-            self.x_range_final = (x_min - margin, x_max + margin)
-            self.y_range_final = (y_min - margin, y_max + margin)
             x_range = x_max - x_min
             y_range = y_max - y_min
             if x_range > y_range:
@@ -127,33 +140,99 @@ class CompassApp:
             scaled_ys = ys * self.scale_y
             self.center_x = (max(scaled_xs) + min(scaled_xs)) / 2
             self.center_y = (max(scaled_ys) + min(scaled_ys)) / 2
-            calibrated_xs = scaled_xs - self.center_x
-            calibrated_ys = scaled_ys - self.center_y
-            self.line2.set_data(scaled_xs, scaled_ys)
-            self.ax2.set_title(f"After Scaling Only\n(Scale: x={self.scale_x:.3f}, y={self.scale_y:.3f})")
-            self.line3.set_data(calibrated_xs, calibrated_ys)
-            self.ax3.set_title(f"Fully Calibrated\n(Offset: ({self.center_x:.1f}, {self.center_y:.1f}), Scale: x={self.scale_x:.3f}, y={self.scale_y:.3f})")
-            self.ax2.set_xlim(min(scaled_xs) - 50, max(scaled_xs) + 50)
-            self.ax2.set_ylim(min(scaled_ys) - 50, max(scaled_ys) + 50)
-            self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
-            self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
-            self.ax2.plot(self.center_x, self.center_y, 'ro')
-            self.ax3.plot(0, 0, 'ro')
-            self.ax1.plot(self.center_x, self.center_y, 'ro')
+            self.calibration_done = True
 
-    def get_calibrated_data(self):
-        if self.calibration_done:
+    def run_algorithm(self):
+        if not self.calibration_done:
+            print("[ERROR] 校准未完成，无法运行算法")
+            return
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        line1, = ax1.plot([], [], 'r.', markersize=3)
+        line2, = ax2.plot([], [], 'b.', markersize=3)
+        ax1.set_title("Raw Data")
+        ax2.set_title("Calibrated Data")
+        ax1.set_xlabel("mag_x")
+        ax1.set_ylabel("mag_y")
+        ax2.set_xlabel("mag_x")
+        ax2.set_ylabel("mag_y")
+        ax1.axhline(0, color='black', lw=0.5)
+        ax1.axvline(0, color='black', lw=0.5)
+        ax2.axhline(0, color='black', lw=0.5)
+        ax2.axvline(0, color='black', lw=0.5)
+        ax1.grid(True)
+        ax2.grid(True)
+        ax1.axis('equal')
+        ax2.axis('equal')
+        ax1.set_xlim(-300, 300)
+        ax1.set_ylim(-300, 300)
+        ax2.set_xlim(-300, 300)
+        ax2.set_ylim(-300, 300)
+
+        def animate(i):
+            while self.ser.in_waiting:
+                line_str = self.ser.readline().decode('utf-8', errors='replace').strip()
+                try:
+                    data = line_str.split(',')
+                    if len(data) >= 2:
+                        x = int(data[0].split('=')[1])
+                        y = int(data[1].split('=')[1])
+                        if (x, y) not in self.raw_data:
+                            self.raw_data.append((x, y))
+                            if len(self.raw_data) > config.MAX_POINTS:
+                                self.raw_data.pop(0)
+                except Exception as e:
+                    print(f"[ERROR] 数据解析失败: {e}")
+                    continue
+
             xs = np.array([x[0] for x in self.raw_data])
             ys = np.array([y[1] for y in self.raw_data])
+            line1.set_data(xs, ys)
+
             scaled_xs = xs * self.scale_x
             scaled_ys = ys * self.scale_y
             calibrated_xs = scaled_xs - self.center_x
             calibrated_ys = scaled_ys - self.center_y
-            return list(zip(calibrated_xs, calibrated_ys))
-        else:
-            return []
+            line2.set_data(calibrated_xs, calibrated_ys)
+
+            ax1.set_xlim(min(xs) - 50, max(xs) + 50)
+            ax1.set_ylim(min(ys) - 50, max(ys) + 50)
+            ax2.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
+            ax2.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
+
+        ani = FuncAnimation(fig, animate, frames=None, interval=config.UPDATE_INTERVAL, blit=False, cache_frame_data=False)
+        plt.tight_layout()
+        plt.show()
 
     def stop_serial(self):
         if self.ser and self.ser.is_open:
             self.ser.close()
+            self.ser = None  # 确保关闭串口连接
             print("[INFO] 串口已关闭")
+        self.calibrate_data()  # 停止时进行校准
+        self.update_plots()  # 更新所有图
+
+    def update_plots(self):
+        xs = np.array([x[0] for x in self.raw_data])
+        ys = np.array([y[1] for y in self.raw_data])
+        scaled_xs = xs * self.scale_x
+        scaled_ys = ys * self.scale_y
+        calibrated_xs = scaled_xs - self.center_x
+        calibrated_ys = scaled_ys - self.center_y
+
+        self.line1.set_data(xs, ys)
+        self.line2.set_data(scaled_xs, scaled_ys)
+        self.line3.set_data(calibrated_xs, calibrated_ys)
+
+        self.ax1.set_xlim(min(xs) - 50, max(xs) + 50)
+        self.ax1.set_ylim(min(ys) - 50, max(ys) + 50)
+        self.ax2.set_xlim(min(scaled_xs) - 50, max(scaled_xs) + 50)
+        self.ax2.set_ylim(min(scaled_ys) - 50, max(scaled_ys) + 50)
+        self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
+        self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
+
+        self.ax1.plot(self.center_x, self.center_y, 'ro')  # 显示圆心
+        self.ax2.plot(self.center_x, self.center_y, 'ro')  # 显示圆心
+        self.ax3.plot(0, 0, 'ro')  # 显示归零后的圆心
+
+        self.fig.canvas.draw()  # 刷新图形

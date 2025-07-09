@@ -85,8 +85,8 @@ class CompassUI(QWidget):
     def complete_calibration(self):
         if self.app_instance is not None:
             self.app_instance.calibrate_data()
-            self.is_calibrated = True
-            self.calibration_button.setEnabled(True)  # 校准完成后启用 Calibration 按钮
+            self.is_calibrated = True  # 校准完成后启用 Calibration 按钮
+            self.calibration_button.setEnabled(True)
             self.run_button.setEnabled(True)  # 校准完成后启用 Run 按钮
             self.stop_button.setEnabled(False)  # 校准完成后禁用 Stop 按钮
             QMessageBox.information(self, "Calibration Complete", "Calibration is complete. You can now run the algorithm.")
@@ -102,30 +102,17 @@ class CompassUI(QWidget):
         self.calibration_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
-        # 模拟算法运行
-        self.process_data()
-
-    def process_data(self):
+        # 调用 CompassApp 的 run_algorithm 方法
         if self.app_instance is not None:
-            calibrated_data = self.app_instance.get_calibrated_data()
-            result = self.run_algorithm(calibrated_data)
-            QMessageBox.information(self, "Algorithm Result", f"Processed Data:\n{result}")
+            self.app_instance.run_algorithm()
         else:
             QMessageBox.warning(self, "Warning", "No data available to process.")
 
         self.stop_operation()
 
-    def run_algorithm(self, data):
-        # 示例算法：计算平均值
-        if not data:
-            return "No data available."
-        xs = [x[0] for x in data]
-        ys = [x[1] for x in data]
-        avg_x = sum(xs) / len(xs)
-        avg_y = sum(ys) / len(ys)
-        return f"Average X: {avg_x:.2f}, Average Y: {avg_y:.2f}"
-
     def stop_operation(self):
+        if hasattr(self, 'calibration_timer'):
+            self.calibration_timer.stop()
         if self.app_instance is not None:
             self.app_instance.stop_serial()
             self.app_instance.calibration_done = False
@@ -134,9 +121,6 @@ class CompassUI(QWidget):
         self.calibration_button.setEnabled(True)
         self.run_button.setEnabled(self.is_calibrated)  # 如果已经校准，则启用 Run 按钮
         self.stop_button.setEnabled(False)
-
-        if hasattr(self, 'calibration_timer') and self.calibration_timer.isActive():
-            self.calibration_timer.stop()
 
     def clear_app_instance(self):
         if self.app_instance is not None:

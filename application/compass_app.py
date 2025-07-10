@@ -27,6 +27,8 @@ class CompassApp:
         self.init_plot()
 
     def connect_serial(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()  # 先关闭已有连接
         try:
             self.ser = serial.Serial(self.port, self.baud_rate, timeout=config.TIMEOUT)
             print(f"[INFO] 已连接到串口 {self.port}")
@@ -130,6 +132,8 @@ class CompassApp:
         return self.line1, self.line2, self.line3
 
     def calibrate_data(self):
+        if len(self.raw_data) < 6:  # 至少需要3对有效点
+            raise ValueError("至少需要6个有效数据点进行校准")
         if len(self.raw_data) >= 6:
             xs = np.array([x[0] for x in self.raw_data])
             ys = np.array([y[1] for y in self.raw_data])

@@ -59,6 +59,7 @@ class CompassUI(QWidget):
     def start_calibration(self):
         if self.app_instance is not None:
             self.stop_operation()  # 如果已经有实例在运行，先停止
+            time.sleep(0.5)  # 添加短暂延迟等待资源释放
             del self.app_instance
 
         port = self.port_combo.currentText()
@@ -127,3 +128,14 @@ class CompassUI(QWidget):
             del self.app_instance
             self.app_instance = None
             print("[INFO] 数据实例已释放")
+
+    # 添加状态同步机制
+    def update_status(self):
+        if self.app_instance is not None:
+            self.calibration_button.setEnabled(not self.app_instance.data_collection_started)
+            self.run_button.setEnabled(self.app_instance.is_calibrated)
+            self.stop_button.setEnabled(self.app_instance.is_running)
+        else:
+            self.calibration_button.setEnabled(True)
+            self.run_button.setEnabled(False)
+            self.stop_button.setEnabled(False)

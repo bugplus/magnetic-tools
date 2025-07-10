@@ -1,4 +1,5 @@
 # compass_app.py
+# compass_app.py
 import serial
 import time
 import numpy as np
@@ -11,6 +12,7 @@ class CompassApp:
         self.raw_data = []
         self.ser = None
         self.calibration_done = False
+        self.calibration_completed = False  # 新增校准完成标志位
         self.data_collection_started = False
         self.start_time = None
         self.scale_x = self.scale_y = 1.0
@@ -68,57 +70,62 @@ class CompassApp:
         plt.show()
 
     def update(self, frame):
-        if self.ser and self.ser.is_open and self.data_collection_started and not self.calibration_done:
-            while self.ser.in_waiting:
-                line_str = self.ser.readline().decode('utf-8', errors='replace').strip()
-                try:
-                    data = line_str.split(',')
-                    if len(data) >= 2:
-                        x = int(data[0].split('=')[1])
-                        y = int(data[1].split('=')[1])
-                        if (x, y) not in self.raw_data:
-                            self.raw_data.append((x, y))
-                            if len(self.raw_data) > config.MAX_POINTS:
-                                self.raw_data.pop(0)
-                            if self.data_collection_started and (time.time() - self.start_time <= config.CALIBRATION_DURATION):
-                                print(f"Received Data: mag_x={x}, mag_y={y}")
-                            if not self.data_collection_started:
-                                self.start_time = time.time()
-                                self.data_collection_started = True
-                except Exception as e:
-                    print(f"[ERROR] 数据解析失败: {e}")
-                    continue
+        if self.ser and self.ser.is_open:
+            # 仅在未完成校准且未标记完成时处理数据
+            if not self.calibration_completed and self.data_collection_started and not self.calibration_done:
+                while self.ser.in_waiting:
+                    line_str = self.ser.readline().decode('utf-8', errors='replace').strip()
+                    try:
+                        data = line_str.split(',')
+                        if len(data) >= 2:
+                            x = int(data[0].split('=')[1])
+                            y = int(data[1].split('=')[1])
+                            if (x, y) not in self.raw_data:
+                                self.raw_data.append((x, y))
+                                if len(self.raw_data) > config.MAX_POINTS:
+                                    self.raw_data.pop(0)
+                                if self.data_collection_started and (time.time() - self.start_time <= config.CALIBRATION_DURATION):
+                                    print(f"Received Data: mag_x={x}, mag_y={y}")
+                                if not self.data_collection_started:
+                                    self.start_time = time.time()
+                                    self.data_collection_started = True
+                    except Exception as e:
+                        print(f"[ERROR] 数据解析失败: {e}")
+                        continue
 
-        if len(self.raw_data) >= 2 and not self.calibration_done:
-            xs = np.array([x[0] for x in self.raw_data])
-            ys = np.array([y[1] for y in self.raw_data])
-            self.line1.set_data(xs, ys)
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
-            margin = 50
-            self.ax1.set_xlim(x_min - margin, x_max + margin)
-            self.ax1.set_ylim(y_min - margin, y_max + margin)
+            # 更新原始数据图
+            if len(self.raw_data) >= 2 and not self.calibration_done:
+                xs = np.array([x[0] for x in self.raw_data])
+                ys = np.array([y[1] for y in self.raw_data])
+                self.line1.set_data(xs, ys)
+                x_min, x_max = min(xs), max(xs)
+                y_min, y_max = min(ys), max(ys)
+                margin = 50
+                self.ax1.set_xlim(x_min - margin, x_max + margin)
+                self.ax1.set_ylim(y_min - margin, y_max + margin)
 
-        if self.data_collection_started and not self.calibration_done and (time.time() - self.start_time > config.CALIBRATION_DURATION):
-            self.calibrate_data()
-            self.calibration_done = True
-            print("[INFO] 校准完成，已切换至校准图")
+            # 处理校准完成逻辑
+            if self.data_collection_started and not self.calibration_done and (time.time() - self.start_time > config.CALIBRATION_DURATION):
+                self.calibrate_data()
+                self.calibration_done = True
+                print("[INFO] 校准完成，已切换至校准图")
 
-        if self.calibration_done:
-            xs = np.array([x[0] for x in self.raw_data])
-            ys = np.array([y[1] for y in self.raw_data])
-            scaled_xs = xs * self.scale_x
-            scaled_ys = ys * self.scale_y
-            calibrated_xs = scaled_xs - self.center_x
-            calibrated_ys = scaled_ys - self.center_y
-            self.line2.set_data(scaled_xs, scaled_ys)
-            self.line3.set_data(calibrated_xs, calibrated_ys)
-            self.ax2.set_xlim(min(scaled_xs) - 50, max(scaled_xs) + 50)
-            self.ax2.set_ylim(min(scaled_ys) - 50, max(scaled_ys) + 50)
-            self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
-            self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
-            self.ax2.plot(self.center_x, self.center_y, 'ro')  # 显示圆心
-            self.ax3.plot(0, 0, 'ro')  # 显示归零后的圆心
+            # 更新校准后视图
+            if self.calibration_done:
+                xs = np.array([x[0] for x in self.raw_data])
+                ys = np.array([y[1] for y in self.raw_data])
+                scaled_xs = xs * self.scale_x
+                scaled_ys = ys * self.scale_y
+                calibrated_xs = scaled_xs - self.center_x
+                calibrated_ys = scaled_ys - self.center_y
+                self.line2.set_data(scaled_xs, scaled_ys)
+                self.line3.set_data(calibrated_xs, calibrated_ys)
+                self.ax2.set_xlim(min(scaled_xs) - 50, max(scaled_xs) + 50)
+                self.ax2.set_ylim(min(scaled_ys) - 50, max(scaled_ys) + 50)
+                self.ax3.set_xlim(min(calibrated_xs) - 50, max(calibrated_xs) + 50)
+                self.ax3.set_ylim(min(calibrated_ys) - 50, max(calibrated_ys) + 50)
+                self.ax2.plot(self.center_x, self.center_y, 'ro')  # 显示圆心
+                self.ax3.plot(0, 0, 'ro')  # 显示归零后的圆心
 
         return self.line1, self.line2, self.line3
 
@@ -141,10 +148,11 @@ class CompassApp:
             self.center_x = (max(scaled_xs) + min(scaled_xs)) / 2
             self.center_y = (max(scaled_ys) + min(scaled_ys)) / 2
             self.calibration_done = True
+            self.calibration_completed = True  # 校准完成后设置标志位
 
     def run_algorithm(self):
-        if not self.calibration_done:
-            print("[ERROR] 校准未完成，无法运行算法")
+        if self.calibration_completed:
+            print("[INFO] 校准已完成，算法运行中不会接收新数据")
             return
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
@@ -170,6 +178,8 @@ class CompassApp:
         ax2.set_ylim(-300, 300)
 
         def animate(i):
+            if self.calibration_completed:
+                return  # 校准完成后直接退出动画更新
             while self.ser.in_waiting:
                 line_str = self.ser.readline().decode('utf-8', errors='replace').strip()
                 try:
@@ -209,8 +219,14 @@ class CompassApp:
             self.ser.close()
             self.ser = None  # 确保关闭串口连接
             print("[INFO] 串口已关闭")
-        self.calibrate_data()  # 停止时进行校准
-        self.update_plots()  # 更新所有图
+        self.calibration_done = False
+        self.calibration_completed = False  # 重置校准状态
+        self.data_collection_started = False
+        self.raw_data.clear()
+        self.start_time = None
+        self.scale_x = self.scale_y = 1.0
+        self.center_x = self.center_y = 0.0
+        print("[INFO] 数据实例已重置")
 
     def update_plots(self):
         xs = np.array([x[0] for x in self.raw_data])

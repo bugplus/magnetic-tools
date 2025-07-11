@@ -11,6 +11,7 @@ from compass_app import CompassApp
 import config
 import os
 import datetime
+import matplotlib as mpl
 
 class CompassUI(QWidget):
     def __init__(self):
@@ -285,43 +286,167 @@ class CompassUI(QWidget):
         
         plt.show()
 
-        # 添加3D可视化
-        fig_3d = plt.figure(figsize=(10, 8))
-        ax_3d = fig_3d.add_subplot(111, projection='3d')
-        fig_3d.suptitle("3D Magnetic Field Distribution", fontsize=16)
+        """显示增强的3D可视化效果"""
+        # ... [获取校准参数和数据] ...
         
-        # 提取原始磁力计数据
-        xs = [x for x, y, z, p, r in raw_data]
-        ys = [y for x, y, z, p, r in raw_data]
-        zs = [z for x, y, z, p, r in raw_data]
+        # 创建画布布局
+        fig = plt.figure(figsize=(20, 12))
         
-        # 3D散点图
-        scatter = ax_3d.scatter(xs, ys, zs, c='blue', s=20, alpha=0.7)
+        # === 1. 3D主视图（动态交互） ===
+        ax_main = fig.add_subplot(231, projection='3d', facecolor='#f0f0f0')
+        ax_main.set_title("Enhanced 3D Magnetic Field", fontsize=14, pad=15)
         
-        # 设置标签和视角
-        ax_3d.set_xlabel("Mag X")
-        ax_3d.set_ylabel("Mag Y")
-        ax_3d.set_zlabel("Mag Z")
-        ax_3d.view_init(elev=30, azim=45)  # 最佳观察角度
+        # 提取原始磁力数据
+        xs = [x for x, y, z, p, r in self.app_instance.raw_data]
+        ys = [y for x, y, z, p, r in self.app_instance.raw_data]
+        zs = [z for x, y, z, p, r in self.app_instance.raw_data]
         
-        # 计算并绘制拟合球体
-        center_x = np.mean(xs)
-        center_y = np.mean(ys)
-        center_z = np.mean(zs)
-        radius = np.mean([np.sqrt((x-center_x)**2 + (y-center_y)**2 + (z-center_z)**2) 
-                        for x, y, z in zip(xs, ys, zs)])
+        # 创建色彩映射（按矢量大小）
+        magnitudes = np.sqrt(np.square(xs) + np.square(ys) + np.square(zs))
+        color_map = plt.cm.viridis
+        norm = plt.Normalize(min(magnitudes), max(magnitudes))
         
-        # 生成球面点
-        u = np.linspace(0, 2 * np.pi, 100)
-        v = np.linspace(0, np.pi, 100)
-        x = center_x + radius * np.outer(np.cos(u), np.sin(v))
-        y = center_y + radius * np.outer(np.sin(u), np.sin(v))
-        z = center_z + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+        # 点云绘制（半透明效果）
+        scatter = ax_main.scatter(xs, ys, zs, 
+                                c=color_map(norm(magnitudes)), 
+                                s=15, 
+                                alpha=0.7, 
+                                depthshade=True)
         
-        # 绘制拟合球体
-        ax_3d.plot_surface(x, y, z, color='red', alpha=0.1)
+        # 添加色彩条
+        cbar = fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=color_map),
+                   ax=ax_main, shrink=0.7)
+        cbar.set_label('Magnetic Magnitude (μT)', fontsize=10)
         
-        plt.tight_layout()
+        # === 2. 理论参考球面 ===
+        # 计算平均半径作为参考
+        avg_radius = np.mean(magnitudes)
+        
+        # 生成参考球面
+        u = np.linspace(0, 2 * np.pi, 50)
+        v = np.linspace(0, np.pi, 25)
+        x_ref = avg_radius * np.outer(np.cos(u), np.sin(v))
+        y_ref = avg_radius * np.outer(np.sin(u), np.sin(v))
+        z_ref = avg_radius * np.outer(np.ones(np.size(u)), np.cos(v))
+        
+        # 绘制透明参考球面
+        ax_main.plot_surface(x_ref, y_ref, z_ref, 
+                            color='red', 
+                            alpha=0.15, 
+                            edgecolor='darkred', 
+                            linewidth=0.5)
+        
+        # === 3. 正交投影视图 ===
+        def create_ortho_view(ax, plane='xy'):
+            """创建正交投影视图"""
+            if plane == 'xy':
+                x, y = xs, ys
+                z = zs
+                labels = ('Mag X', 'Mag Y')
+            elif plane == 'xz':
+                x, y = xs, zs
+                z = ys
+                labels = ('Mag X', 'Mag Z')
+            else:  # 'yz'
+                x, y = ys, zs
+                z = xs
+                labels = ('Mag Y', 'Mag Z')
+                
+            # 密度热力图
+            hb = ax.hexbin(x, y, 
+                            gridsize=30,
+                            cmap='viridis',
+                            bins='log',
+                            mincnt=1)
+            
+            # 添加颜色条
+            fig.colorbar(hb, ax=ax, label='Density')
+            
+            ax.set_title(f"{plane.upper()} Plane Projection", fontsize=12)
+            ax.set_xlabel(labels[0], fontsize=10)
+            ax.set_ylabel(labels[1], fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.7)
+            
+            # 标记原点
+            ax.scatter([0], [0], color='red', s=50, marker='+')
+        
+        # XY平面投影
+        ax_xy = fig.add_subplot(234)
+        create_ortho_view(ax_xy, 'xy')
+        
+        # XZ平面投影
+        ax_xz = fig.add_subplot(235)
+        create_ortho_view(ax_xz, 'xz')
+        
+        # YZ平面投影
+        ax_yz = fig.add_subplot(236)
+        create_ortho_view(ax_yz, 'yz')
+        
+        # === 4. 径向偏差分析 ===
+        ax_radial = fig.add_subplot(232, projection='polar')
+        
+        # 计算角度和半径偏差
+        radii = np.sqrt(np.square(xs) + np.square(ys) + np.square(zs))
+        mean_radius = np.mean(radii)
+        deviations = (radii - mean_radius) / mean_radius * 100  # 百分比偏差
+        
+        # 计算方位角
+        azimuth = np.arctan2(ys, xs)  # 弧度
+        
+        # 分箱统计
+        azimuth_bins = np.linspace(0, 2*np.pi, 24)
+        bin_means = []
+        for i in range(len(azimuth_bins)-1):
+            mask = (azimuth >= azimuth_bins[i]) & (azimuth < azimuth_bins[i+1])
+            if np.any(mask):
+                bin_means.append(np.mean(deviations[mask]))
+            else:
+                bin_means.append(0)
+        
+        # 绘制径向偏差
+        bars = ax_radial.bar(azimuth_bins[:-1], 
+                            bin_means, 
+                            width=2*np.pi/24, 
+                            alpha=0.7,
+                            color='blue')
+        
+        # 美化图表
+        ax_radial.set_title("Radial Deviation by Azimuth (°)", fontsize=12, pad=15)
+        ax_radial.set_rlabel_position(315)  # 移动半径标签位置
+        ax_radial.grid(True, linestyle='--', alpha=0.7)
+        
+        # === 5. 偏差值分布直方图 ===
+        ax_hist = fig.add_subplot(233)
+        ax_hist.hist(deviations, bins=30, color='green', alpha=0.7)
+        ax_hist.axvline(0, color='red', linestyle='--')
+        ax_hist.set_title("Radial Deviation Distribution", fontsize=12)
+        ax_hist.set_xlabel("Deviation (%)")
+        ax_hist.set_ylabel("Count")
+        ax_hist.grid(True, alpha=0.3)
+        
+        # 添加统计信息
+        mean_dev = np.mean(deviations)
+        std_dev = np.std(deviations)
+        ax_hist.text(0.05, 0.9, 
+                    f"Mean: {mean_dev:.2f}%\nStd: {std_dev:.2f}%", 
+                    transform=ax_hist.transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8))
+        
+        # 添加整体描述
+        fig.text(0.5, 0.92, 
+                f"3D Magnetic Field Analysis | Points: {len(xs)} | Avg Magnitude: {np.mean(magnitudes):.1f}μT ± {np.std(magnitudes):.1f}μT", 
+                fontsize=14, ha='center')
+        
+        # 添加图例和说明
+        fig.text(0.1, 0.02, 
+                "Blue points: Raw magnetic measurements | Red sphere: Theoretical reference sphere", 
+                fontsize=10)
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # 保存数据到文本文件
+        self.save_data_to_file(raw_data, processed_data, scale_x, scale_y, center_x, center_y)
+        
         plt.show()
 
     # compass_ui.py (修正后的save_data_to_file方法)

@@ -52,26 +52,26 @@ class CompassApp:
         
         # 创建三视图画布 (1行3列)
         self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(1, 3, figsize=(18, 6))
-        plt.get_current_fig_manager().set_window_title("磁力计数据收集")
+        plt.get_current_fig_manager().set_window_title("mag-compass data collector")
         
         # 设置图1: 原始数据
-        self.ax1.set_title("原始数据 (图1)")
-        self.ax1.set_xlabel("磁力计 X")
-        self.ax1.set_ylabel("磁力计 Y")
+        self.ax1.set_title("Raw Data (Fig1)")
+        self.ax1.set_xlabel("Mag X")
+        self.ax1.set_ylabel("Mag Y")
         self.ax1.grid(True)
         self.scatter1 = self.ax1.scatter([], [], c='blue', s=15, alpha=0.6)
         
         # 设置图2: 缩放数据 (初始为空)
-        self.ax2.set_title("缩放数据 (图2)")
-        self.ax2.set_xlabel("缩放 X")
-        self.ax2.set_ylabel("缩放 Y")
+        self.ax2.set_title("Scaled Data (Fig2)")
+        self.ax2.set_xlabel("Scaled X")
+        self.ax2.set_ylabel("Scaled Y")
         self.ax2.grid(True)
         self.scatter2 = self.ax2.scatter([], [], c='green', s=15, alpha=0.6)
         
         # 设置图3: 校准数据 (初始为空)
-        self.ax3.set_title("校准数据 (图3)")
-        self.ax3.set_xlabel("校准 X")
-        self.ax3.set_ylabel("校准 Y")
+        self.ax3.set_title("Calibrated Data (Fig3)")
+        self.ax3.set_xlabel("Calibrated X")
+        self.ax3.set_ylabel("Calibrated Y")
         self.ax3.grid(True)
         self.scatter3 = self.ax3.scatter([], [], c='red', s=15, alpha=0.6)
         

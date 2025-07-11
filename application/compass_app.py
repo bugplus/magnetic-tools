@@ -1,6 +1,7 @@
 # compass_app.py
-import serial
+import math
 import numpy as np
+import serial
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import config
@@ -11,11 +12,12 @@ class CompassApp:
         self.port = port
         self.baud_rate = baud_rate
         self.ser = None
-        self.raw_data = []  # 原始数据
+        self.raw_data = []  # 原始数据: (mag_x, mag_y, mag_z, pitch, roll)
         self.scale_x = 1.0  # X轴缩放因子
         self.scale_y = 1.0  # Y轴缩放因子
         self.center_x = 0.0  # X轴中心偏移
         self.center_y = 0.0  # Y轴中心偏移
+        self.partial_data = {}  # 用于存储部分解析的数据
         
         # 三视图画布相关
         self.fig = None
@@ -47,6 +49,7 @@ class CompassApp:
         """启动数据收集和三视图显示"""
         # 重置状态
         self.raw_data = []
+        self.partial_data = {}
         self.data_collection_active = True
         self.calibration_complete = False
         
@@ -94,6 +97,24 @@ class CompassApp:
         
         plt.show(block=False)
 
+    def tilt_compensation(self, mag_x, mag_y, mag_z, pitch, roll):
+        """倾角补偿：将磁力计数据从载体坐标系转换到水平坐标系"""
+        # 将角度转换为弧度
+        pitch_rad = math.radians(pitch)
+        roll_rad = math.radians(roll)
+        
+        # 计算旋转矩阵分量
+        cos_pitch = math.cos(pitch_rad)
+        sin_pitch = math.sin(pitch_rad)
+        cos_roll = math.cos(roll_rad)
+        sin_roll = math.sin(roll_rad)
+        
+        # 计算补偿后的磁力值
+        mag_x_comp = mag_x * cos_pitch + mag_z * sin_pitch
+        mag_y_comp = mag_x * sin_roll * sin_pitch + mag_y * cos_roll - mag_z * sin_roll * cos_pitch
+        
+        return mag_x_comp, mag_y_comp
+
     def update_plot(self, frame):
         """更新三视图（校准期间只更新图1）"""
         if not self.data_collection_active or not self.ser or not self.ser.is_open:
@@ -104,29 +125,62 @@ class CompassApp:
             while self.ser.in_waiting:
                 line = self.ser.readline().decode('ascii', errors='ignore').strip()
                 
-                # 解析格式: mag_x=123, mag_y=456
-                if 'mag_x' in line and 'mag_y' in line:
-                    parts = line.split(',')
-                    if len(parts) >= 2:
-                        x_str = parts[0].split('=')[1].strip()
-                        y_str = parts[1].split('=')[1].strip()
-                        
+                # 跳过空行
+                if not line:
+                    continue
+                
+                # 解析数据格式
+                data_dict = {}
+                parts = line.split(',')
+                for part in parts:
+                    part = part.strip()
+                    if '=' in part:
+                        key, value = part.split('=', 1)
+                        key = key.strip().lower()
                         try:
-                            x = float(x_str)
-                            y = float(y_str)
-                            self.raw_data.append((x, y))
-                            
-                            # 限制数据点数量
-                            if len(self.raw_data) > config.MAX_POINTS:
-                                self.raw_data.pop(0)
+                            data_dict[key] = float(value)
                         except ValueError:
+                            # 忽略无法转换的值
                             pass
-        except serial.SerialException:
+                
+                # 处理磁力计数据行
+                if 'mag_x' in data_dict and 'mag_y' in data_dict and 'mag_z' in data_dict:
+                    self.partial_data['mag_x'] = data_dict['mag_x']
+                    self.partial_data['mag_y'] = data_dict['mag_y']
+                    self.partial_data['mag_z'] = data_dict['mag_z']
+                
+                # 处理姿态数据行
+                if 'pitch' in data_dict and 'roll' in data_dict:
+                    self.partial_data['pitch'] = data_dict['pitch']
+                    self.partial_data['roll'] = data_dict['roll']
+                
+                # 检查是否已收集到完整数据
+                if all(key in self.partial_data for key in ['mag_x', 'mag_y', 'mag_z', 'pitch', 'roll']):
+                    # 存储完整数据
+                    self.raw_data.append((
+                        self.partial_data['mag_x'],
+                        self.partial_data['mag_y'],
+                        self.partial_data['mag_z'],
+                        self.partial_data['pitch'],
+                        self.partial_data['roll']
+                    ))
+                    
+                    # 限制数据点数量
+                    if len(self.raw_data) > config.MAX_POINTS:
+                        self.raw_data.pop(0)
+                    
+                    # 重置部分数据
+                    self.partial_data = {}
+                    
+        except Exception as e:
+            print(f"数据处理错误: {e}")
             return self.scatter1, self.scatter2, self.scatter3
         
         # 更新图1（原始数据）
         if self.raw_data:
-            xs, ys = zip(*self.raw_data)
+            # 提取XY数据（原始磁力计XY值）
+            xs = [x for x, y, z, p, r in self.raw_data]
+            ys = [y for x, y, z, p, r in self.raw_data]
             self.scatter1.set_offsets(np.column_stack([xs, ys]))
             
             # 自动调整图1的坐标轴范围
@@ -151,9 +205,16 @@ class CompassApp:
             print("校准失败: 数据不足")
             return False
         
-        # 提取X/Y数据
-        xs = [x for x, _ in self.raw_data]
-        ys = [y for _, y in self.raw_data]
+        # 提取所有数据
+        xs = []
+        ys = []
+        
+        # 进行倾角补偿
+        for mag_x, mag_y, mag_z, pitch, roll in self.raw_data:
+            # 应用倾角补偿
+            x_comp, y_comp = self.tilt_compensation(mag_x, mag_y, mag_z, pitch, roll)
+            xs.append(x_comp)
+            ys.append(y_comp)
         
         # 计算范围
         x_min, x_max = min(xs), max(xs)

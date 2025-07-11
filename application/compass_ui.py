@@ -1,5 +1,4 @@
 # compass_ui.py
-# compass_ui.py
 import sys
 import time
 import numpy as np
@@ -28,6 +27,10 @@ class CompassUI(QWidget):
         self.results_button = QPushButton("Show Results")
         self.status_label = QLabel("Status: Ready")
         
+        # 新增校准模式选择
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Horizontal Calibration", "Tilt Calibration"])
+        
         # 初始状态设置
         self.results_button.setEnabled(False)
         self.app_instance = None
@@ -52,10 +55,15 @@ class CompassUI(QWidget):
         self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.baud_combo.setCurrentText("115200")
         baud_layout.addWidget(self.baud_combo, 4)
-        baud_layout.addWidget(self.calibration_button, 2)
+        
+        # 校准模式选择
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Calibration Mode:"))
+        mode_layout.addWidget(self.mode_combo, 4)
         
         # 按钮区域
         button_layout = QHBoxLayout()
+        button_layout.addWidget(self.calibration_button, 1)
         button_layout.addWidget(self.results_button, 1)
         
         # 状态区域
@@ -65,6 +73,7 @@ class CompassUI(QWidget):
         # 组合所有布局
         main_layout.addLayout(port_layout)
         main_layout.addLayout(baud_layout)
+        main_layout.addLayout(mode_layout)
         main_layout.addLayout(button_layout)
         main_layout.addLayout(status_layout)
         self.setLayout(main_layout)
@@ -191,11 +200,26 @@ class CompassUI(QWidget):
         # 获取原始数据
         raw_data = self.app_instance.raw_data
         
-        # 应用算法生成图5数据
-        processed_data = [
-            (x * scale_x - center_x, y * scale_y - center_y)
-            for x, y in raw_data
-        ]
+        # 处理数据（根据校准模式）
+        processed_data = []
+        if "Tilt" in self.mode_combo.currentText():
+            # 倾角校准模式
+            for mag_x, mag_y, mag_z, pitch, roll in raw_data:
+                # 应用倾角补偿
+                x_comp, y_comp = self.app_instance.tilt_compensation(
+                    mag_x, mag_y, mag_z, pitch, roll
+                )
+                # 应用校准参数
+                x_cal = x_comp * scale_x - center_x
+                y_cal = y_comp * scale_y - center_y
+                processed_data.append((x_cal, y_cal))
+        else:
+            # 水平校准模式
+            for mag_x, mag_y, mag_z, pitch, roll in raw_data:
+                # 应用校准参数
+                x_cal = mag_x * scale_x - center_x
+                y_cal = mag_y * scale_y - center_y
+                processed_data.append((x_cal, y_cal))
         
         # 计算原始坐标系中的圆心位置
         raw_center_x = center_x / scale_x
@@ -206,7 +230,8 @@ class CompassUI(QWidget):
         fig.suptitle("Calibration Results Analysis", fontsize=16)
         
         # 图4：原始数据（红色点）
-        xs_raw, ys_raw = zip(*raw_data)
+        xs_raw = [x for x, y, z, p, r in raw_data]
+        ys_raw = [y for x, y, z, p, r in raw_data]
         ax4.scatter(xs_raw, ys_raw, c='red', s=15, alpha=0.6, label="Raw Data")
         ax4.scatter([raw_center_x], [raw_center_y], c='black', s=80, marker='x', label="Center")
         ax4.set_title("Source Data Distribution (Fig 4)")
@@ -260,6 +285,46 @@ class CompassUI(QWidget):
         
         plt.show()
 
+        # 添加3D可视化
+        fig_3d = plt.figure(figsize=(10, 8))
+        ax_3d = fig_3d.add_subplot(111, projection='3d')
+        fig_3d.suptitle("3D Magnetic Field Distribution", fontsize=16)
+        
+        # 提取原始磁力计数据
+        xs = [x for x, y, z, p, r in raw_data]
+        ys = [y for x, y, z, p, r in raw_data]
+        zs = [z for x, y, z, p, r in raw_data]
+        
+        # 3D散点图
+        scatter = ax_3d.scatter(xs, ys, zs, c='blue', s=20, alpha=0.7)
+        
+        # 设置标签和视角
+        ax_3d.set_xlabel("Mag X")
+        ax_3d.set_ylabel("Mag Y")
+        ax_3d.set_zlabel("Mag Z")
+        ax_3d.view_init(elev=30, azim=45)  # 最佳观察角度
+        
+        # 计算并绘制拟合球体
+        center_x = np.mean(xs)
+        center_y = np.mean(ys)
+        center_z = np.mean(zs)
+        radius = np.mean([np.sqrt((x-center_x)**2 + (y-center_y)**2 + (z-center_z)**2) 
+                        for x, y, z in zip(xs, ys, zs)])
+        
+        # 生成球面点
+        u = np.linspace(0, 2 * np.pi, 100)
+        v = np.linspace(0, np.pi, 100)
+        x = center_x + radius * np.outer(np.cos(u), np.sin(v))
+        y = center_y + radius * np.outer(np.sin(u), np.sin(v))
+        z = center_z + radius * np.outer(np.ones(np.size(u)), np.cos(v))
+        
+        # 绘制拟合球体
+        ax_3d.plot_surface(x, y, z, color='red', alpha=0.1)
+        
+        plt.tight_layout()
+        plt.show()
+
+    # compass_ui.py (修正后的save_data_to_file方法)
     def save_data_to_file(self, raw_data, processed_data, scale_x, scale_y, center_x, center_y):
         """将原始数据、处理后的数据和算法描述保存到文本文件"""
         # 创建时间戳
@@ -280,7 +345,7 @@ class CompassUI(QWidget):
         
         try:
             with open(file_path, 'w') as f:
-                # 1. 保存校准参数
+                # 1. 保存校准参数（完全按照图片格式）
                 f.write("=== CALIBRATION PARAMETERS ===\n")
                 f.write(f"Scale X: {scale_x:.6f}\n")
                 f.write(f"Scale Y: {scale_y:.6f}\n")
@@ -291,64 +356,27 @@ class CompassUI(QWidget):
                 
                 # 2. 保存源数据和处理后数据（一行对应一个数据点）
                 f.write("=== RAW AND CALIBRATED DATA ===\n")
-                f.write("Index, Raw_X, Raw_Y, Calibrated_X, Calibrated_Y\n")
+                f.write("Index, Raw_X, Raw_Y, Raw_Z, Pitch, Roll, Calibrated_X, Calibrated_Y\n")
                 
                 # 添加行号并合并数据
-                for i, ((raw_x, raw_y), (cal_x, cal_y)) in enumerate(zip(raw_data, processed_data)):
-                    f.write(f"{i+1}, {raw_x:.6f}, {raw_y:.6f}, {cal_x:.6f}, {cal_y:.6f}\n")
+                for i, ((raw_x, raw_y, raw_z, pitch, roll), (cal_x, cal_y)) in enumerate(zip(raw_data, processed_data)):
+                    # 使用f-string格式化每行数据（保留6位小数）
+                    f.write(f"{i+1}, {raw_x:.6f}, {raw_y:.6f}, {raw_z:.6f}, {pitch:.6f}, {roll:.6f}, {cal_x:.6f}, {cal_y:.6f}\n")
                 
-                f.write("\n\n")
-                
-                # 3. 算法描述（包括缩放因子和偏移值计算）
-                f.write("=== CALIBRATION ALGORITHM ===\n")
-                f.write("Calibration formula:\n")
-                f.write("Calibrated_X = (Raw_X × Scale_X) - Center_X\n")
-                f.write("Calibrated_Y = (Raw_Y × Scale_Y) - Center_Y\n\n")
-                
-                f.write("Calculation details:\n")
-                f.write("1. Collected raw magnetometer data over full 360° rotation\n")
-                
-                # 计算数据范围
-                xs = [x for x, y in raw_data]
-                ys = [y for x, y in raw_data]
-                x_min, x_max = min(xs), max(xs)
-                y_min, y_max = min(ys), max(ys)
-                x_range = x_max - x_min
-                y_range = y_max - y_min
-                
-                f.write(f"   X_min = {x_min:.2f}, X_max = {x_max:.2f}, Range = {x_range:.2f}\n")
-                f.write(f"   Y_min = {y_min:.2f}, Y_max = {y_max:.2f}, Range = {y_range:.2f}\n\n")
-                
-                f.write("2. Scale factors calculation:\n")
-                if x_range > y_range:
-                    f.write(f"   Scale_X = 1.0 (fixed)\n")
-                    f.write(f"   Scale_Y = X_range / Y_range = {x_range:.4f} / {y_range:.4f} = {scale_y:.6f}\n")
-                else:
-                    f.write(f"   Scale_X = Y_range / X_range = {y_range:.4f} / {x_range:.4f} = {scale_x:.6f}\n")
-                    f.write(f"   Scale_Y = 1.0 (fixed)\n")
                 f.write("\n")
                 
-                f.write("3. Center point calculation:\n")
-                scaled_xs = [x * scale_x for x in xs]
-                scaled_ys = [y * scale_y for y in ys]
-                center_x_calc = (max(scaled_xs) + min(scaled_xs)) / 2
-                center_y_calc = (max(scaled_ys) + min(scaled_ys)) / 2
-                f.write(f"   Center_X = (max(Scaled_X) + min(Scaled_X)) / 2 = ({max(scaled_xs):.2f} + {min(scaled_xs):.2f}) / 2 = {center_x_calc:.6f}\n")
-                f.write(f"   Center_Y = (max(Scaled_Y) + min(Scaled_Y)) / 2 = ({max(scaled_ys):.2f} + {min(scaled_ys):.2f}) / 2 = {center_y_calc:.6f}\n")
+                # 3. 算法描述（包括倾角补偿公式）
+                f.write("=== CALIBRATION ALGORITHM ===\n")
+                f.write("Calibration formula:\n")
+                f.write("Calibrated_X = (TiltCompensated_X × Scale_X) - Center_X\n")
+                f.write("Calibrated_Y = (TiltCompensated_Y × Scale_Y) - Center_Y\n\n")
                 
+                f.write("Tilt Compensation formula:\n")
+                f.write("pitch_rad = math.radians(pitch)\n")
+                f.write("roll_rad = math.radians(roll)\n")
+                f.write("TiltCompensated_X = mag_x * cos(pitch_rad) + mag_z * sin(pitch_rad)\n")
+                f.write("TiltCompensated_Y = mag_x * sin(roll_rad)*sin(pitch_rad) + mag_y * cos(roll_rad) - mag_z * sin(roll_rad)*cos(pitch_rad)\n")
+            
             QMessageBox.information(self, "Save Successful", f"Calibration data saved to:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Save Failed", f"Error saving data:\n{str(e)}")
-    def cleanup(self):
-        """清理资源"""
-        if self.calibration_timer and self.calibration_timer.isActive():
-            self.calibration_timer.stop()
-        if self.app_instance:
-            self.app_instance.stop()
-        self.calibration_button.setEnabled(True)
-        self.status_label.setText("Status: Operation stopped")
-
-    def closeEvent(self, event):
-        """关闭窗口时清理资源"""
-        self.cleanup()
-        event.accept()

@@ -280,54 +280,65 @@ class CompassUI(QWidget):
         
         try:
             with open(file_path, 'w') as f:
-                # 1. 保存源数据
-                f.write("=== RAW MAGNETOMETER DATA ===\n")
-                f.write("Mag_X, Mag_Y\n")
-                for x, y in raw_data:
-                    f.write(f"{x:.6f}, {y:.6f}\n")
-                f.write("\n\n")
+                # 1. 保存校准参数
+                f.write("=== CALIBRATION PARAMETERS ===\n")
+                f.write(f"Scale X: {scale_x:.6f}\n")
+                f.write(f"Scale Y: {scale_y:.6f}\n")
+                f.write(f"Center X: {center_x:.6f}\n")
+                f.write(f"Center Y: {center_y:.6f}\n")
+                f.write(f"Data Points: {len(raw_data)}\n")
+                f.write(f"Timestamp: {timestamp}\n\n")
                 
-                # 2. 保存算法生成的数据
-                f.write("=== CALIBRATED DATA ===\n")
-                f.write("Calibrated_X, Calibrated_Y\n")
-                for x, y in processed_data:
-                    f.write(f"{x:.6f}, {y:.6f}\n")
+                # 2. 保存源数据和处理后数据（一行对应一个数据点）
+                f.write("=== RAW AND CALIBRATED DATA ===\n")
+                f.write("Index, Raw_X, Raw_Y, Calibrated_X, Calibrated_Y\n")
+                
+                # 添加行号并合并数据
+                for i, ((raw_x, raw_y), (cal_x, cal_y)) in enumerate(zip(raw_data, processed_data)):
+                    f.write(f"{i+1}, {raw_x:.6f}, {raw_y:.6f}, {cal_x:.6f}, {cal_y:.6f}\n")
+                
                 f.write("\n\n")
                 
                 # 3. 算法描述（包括缩放因子和偏移值计算）
-                f.write("=== CALIBRATION ALGORITHM DESCRIPTION ===\n")
-                f.write("Scale and offset calculation algorithm:\n\n")
-                f.write("1. Raw magnetometer data collected over full 360° rotation\n")
-                f.write("2. Find min and max values for X and Y axes:\n")
-                f.write(f"   X_min = {min(x for x, y in raw_data):.2f}, X_max = {max(x for x, y in raw_data):.2f}\n")
-                f.write(f"   Y_min = {min(y for x, y in raw_data):.2f}, Y_max = {max(y for x, y in raw_data):.2f}\n\n")
+                f.write("=== CALIBRATION ALGORITHM ===\n")
+                f.write("Calibration formula:\n")
+                f.write("Calibrated_X = (Raw_X × Scale_X) - Center_X\n")
+                f.write("Calibrated_Y = (Raw_Y × Scale_Y) - Center_Y\n\n")
                 
-                f.write("3. Calculate scale factors:\n")
-                f.write("   if (X_max - X_min) > (Y_max - Y_min):\n")
-                f.write(f"       Scale_X = {scale_x:.6f} (fixed to 1.0)\n")
-                f.write(f"       Scale_Y = {scale_y:.6f} (calculated as (X_range/Y_range))\n")
-                f.write("   else:\n")
-                f.write(f"       Scale_X = {scale_x:.6f} (calculated as (Y_range/X_range))\n")
-                f.write(f"       Scale_Y = {scale_y:.6f} (fixed to 1.0)\n\n")
+                f.write("Calculation details:\n")
+                f.write("1. Collected raw magnetometer data over full 360° rotation\n")
                 
-                f.write("4. Apply scale factors to raw data:\n")
-                f.write("   Scaled_X = Mag_X × Scale_X\n")
-                f.write("   Scaled_Y = Mag_Y × Scale_Y\n\n")
+                # 计算数据范围
+                xs = [x for x, y in raw_data]
+                ys = [y for x, y in raw_data]
+                x_min, x_max = min(xs), max(xs)
+                y_min, y_max = min(ys), max(ys)
+                x_range = x_max - x_min
+                y_range = y_max - y_min
                 
-                f.write("5. Calculate center point:\n")
-                f.write("   Center_X = (max(Scaled_X) + min(Scaled_X)) / 2\n")
-                f.write(f"   Center_X = {center_x:.6f}\n")
-                f.write("   Center_Y = (max(Scaled_Y) + min(Scaled_Y)) / 2\n")
-                f.write(f"   Center_Y = {center_y:.6f}\n\n")
+                f.write(f"   X_min = {x_min:.2f}, X_max = {x_max:.2f}, Range = {x_range:.2f}\n")
+                f.write(f"   Y_min = {y_min:.2f}, Y_max = {y_max:.2f}, Range = {y_range:.2f}\n\n")
                 
-                f.write("6. Apply final calibration:\n")
-                f.write("   Calibrated_X = Scaled_X - Center_X\n")
-                f.write("   Calibrated_Y = Scaled_Y - Center_Y\n")
+                f.write("2. Scale factors calculation:\n")
+                if x_range > y_range:
+                    f.write(f"   Scale_X = 1.0 (fixed)\n")
+                    f.write(f"   Scale_Y = X_range / Y_range = {x_range:.4f} / {y_range:.4f} = {scale_y:.6f}\n")
+                else:
+                    f.write(f"   Scale_X = Y_range / X_range = {y_range:.4f} / {x_range:.4f} = {scale_x:.6f}\n")
+                    f.write(f"   Scale_Y = 1.0 (fixed)\n")
+                f.write("\n")
+                
+                f.write("3. Center point calculation:\n")
+                scaled_xs = [x * scale_x for x in xs]
+                scaled_ys = [y * scale_y for y in ys]
+                center_x_calc = (max(scaled_xs) + min(scaled_xs)) / 2
+                center_y_calc = (max(scaled_ys) + min(scaled_ys)) / 2
+                f.write(f"   Center_X = (max(Scaled_X) + min(Scaled_X)) / 2 = ({max(scaled_xs):.2f} + {min(scaled_xs):.2f}) / 2 = {center_x_calc:.6f}\n")
+                f.write(f"   Center_Y = (max(Scaled_Y) + min(Scaled_Y)) / 2 = ({max(scaled_ys):.2f} + {min(scaled_ys):.2f}) / 2 = {center_y_calc:.6f}\n")
                 
             QMessageBox.information(self, "Save Successful", f"Calibration data saved to:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Save Failed", f"Error saving data:\n{str(e)}")
-
     def cleanup(self):
         """清理资源"""
         if self.calibration_timer and self.calibration_timer.isActive():

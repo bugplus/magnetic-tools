@@ -31,8 +31,8 @@ class CompassApp:
         self.data_collection_active = False
         self.calibration_complete = False
 
-    def connect_serial(self):
-        """连接串口"""
+    def connect_serial(self, connect_only=False):
+        """连接串口，增加connect_only参数"""
         try:
             self.ser = serial.Serial(
                 self.port, 
@@ -42,9 +42,9 @@ class CompassApp:
             print(f"已连接串口: {self.port}@{self.baud_rate}波特")
             return True
         except Exception as e:
-            print(f"串口连接失败: {e}")
+            if not connect_only:
+                print(f"串口连接失败: {e}")
             return False
-
     def start_data_collection(self):
         """启动数据收集和三视图显示"""
         # 重置状态

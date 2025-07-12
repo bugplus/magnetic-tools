@@ -16,6 +16,7 @@ import matplotlib as mpl
 class CompassUI(QWidget):
     def __init__(self):
         super().__init__()
+        self.main_layout = None  # 1. 在构造函数中声明主布局变量
         # 英文界面设置
         self.setWindowTitle("Compass Calibration System")
         self.setMinimumSize(600, 250)
@@ -27,7 +28,18 @@ class CompassUI(QWidget):
         self.calibration_button = QPushButton("Start Calibration")
         self.results_button = QPushButton("Show Results")
         self.status_label = QLabel("Status: Ready")
+        # 新增UI元素
+        self.run_button = QPushButton("Run Real-time")
+        self.stop_button = QPushButton("Stop")
+        self.pause_button = QPushButton("Pause")
         
+        # 状态标签
+        self.realtime_status = QLabel("Real-time: Stopped")
+        
+        # 初始化状态
+        self.realtime_active = False
+        self.realtime_paused = False
+        self.realtime_data = []  # 存储实时数据点
         # 新增校准模式选择
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Horizontal Calibration", "Tilt Calibration"])
@@ -84,6 +96,175 @@ class CompassUI(QWidget):
         self.calibration_button.clicked.connect(self.start_calibration)
         self.results_button.clicked.connect(self.show_algorithm_results)
 
+        # 新增实时控制区域
+        realtime_layout = QHBoxLayout()
+        realtime_layout.addWidget(self.run_button)
+        realtime_layout.addWidget(self.pause_button)
+        realtime_layout.addWidget(self.stop_button)
+        realtime_layout.addWidget(self.realtime_status)
+        
+        # 添加到主布局
+        main_layout.addLayout(realtime_layout)
+        
+        # 连接信号
+        self.run_button.clicked.connect(self.start_realtime)
+        self.pause_button.clicked.connect(self.toggle_pause)
+        self.stop_button.clicked.connect(self.stop_realtime)
+
+    def start_realtime(self):
+        """启动实时模式"""
+        if not self.is_calibrated:
+            QMessageBox.warning(self, "Error", "Please calibrate first!")
+            return
+            
+        # 确保串口连接
+        if not self.app_instance or not self.app_instance.ser or not self.app_instance.ser.is_open:
+            self.start_calibration(connect_only=True)
+            
+        if not self.app_instance.ser.is_open:
+            QMessageBox.critical(self, "Connection Error", "Serial port not connected")
+            return
+            
+        # 创建实时绘图窗口
+        self.realtime_fig, (self.ax_raw, self.ax_cal) = plt.subplots(1, 2, figsize=(14, 6))
+        self.realtime_fig.suptitle("Real-time Compass Data", fontsize=16)
+        
+        # 设置原始数据图
+        self.ax_raw.set_title("Raw Data")
+        self.ax_raw.set_xlabel("Mag X")
+        self.ax_raw.set_ylabel("Mag Y")
+        self.ax_raw.grid(True)
+        self.ax_raw.axis('equal')
+        self.ax_raw.set_xlim(-300, 300)
+        self.ax_raw.set_ylim(-300, 300)
+        self.scatter_raw = self.ax_raw.scatter([], [], c='red', s=15, alpha=0.6, label="Raw")
+        
+        # 设置校准后数据图
+        self.ax_cal.set_title("Calibrated Data")
+        self.ax_cal.set_xlabel("Calibrated X")
+        self.ax_cal.set_ylabel("Calibrated Y")
+        self.ax_cal.grid(True)
+        self.ax_cal.axhline(0, color='black', linewidth=0.8)
+        self.ax_cal.axvline(0, color='black', linewidth=0.8)
+        self.ax_cal.axis('equal')
+        self.ax_cal.set_xlim(-200, 200)
+        self.ax_cal.set_ylim(-200, 200)
+        self.scatter_cal = self.ax_cal.scatter([], [], c='blue', s=15, alpha=0.6, label="Calibrated")
+        
+        plt.legend()
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.show(block=False)
+        
+        # 初始化实时数据存储
+        self.realtime_data = []
+        self.realtime_active = True
+        self.realtime_paused = False
+        self.realtime_status.setText("Real-time: Running")
+        
+        # 启动定时器
+        self.realtime_timer = QTimer(self)
+        self.realtime_timer.timeout.connect(self.update_realtime_plot)
+        self.realtime_timer.start(100)  # 10Hz更新频率
+        
+    def toggle_pause(self):
+        """暂停/继续实时模式"""
+        if not self.realtime_active:
+            return
+            
+        self.realtime_paused = not self.realtime_paused
+        status = "Paused" if self.realtime_paused else "Running"
+        self.realtime_status.setText(f"Real-time: {status}")
+        
+    def stop_realtime(self):
+        """停止实时模式"""
+        if self.realtime_timer and self.realtime_timer.isActive():
+            self.realtime_timer.stop()
+            
+        self.realtime_active = False
+        self.realtime_paused = False
+        self.realtime_status.setText("Real-time: Stopped")
+        
+        # 关闭绘图窗口
+        if hasattr(self, 'realtime_fig') and self.realtime_fig:
+            plt.close(self.realtime_fig)
+            
+    def update_realtime_plot(self):
+        """更新实时绘图"""
+        if not self.realtime_active or self.realtime_paused:
+            return
+            
+        if not self.app_instance or not self.app_instance.ser or not self.app_instance.ser.is_open:
+            return
+            
+        try:
+            # 读取串口数据
+            if self.app_instance.ser.in_waiting:
+                line = self.app_instance.ser.readline().decode('ascii', errors='ignore').strip()
+                
+                if not line:
+                    return
+                    
+                # 解析数据
+                data_dict = {}
+                parts = line.split(',')
+                for part in parts:
+                    part = part.strip()
+                    if '=' in part:
+                        key, value = part.split('=', 1)
+                        key = key.strip().lower()
+                        try:
+                            data_dict[key] = float(value)
+                        except ValueError:
+                            pass
+                
+                # 检查是否包含所需数据
+                if 'mag_x' in data_dict and 'mag_y' in data_dict and 'mag_z' in data_dict and 'pitch' in data_dict and 'roll' in data_dict:
+                    mag_x = data_dict['mag_x']
+                    mag_y = data_dict['mag_y']
+                    mag_z = data_dict['mag_z']
+                    pitch = data_dict['pitch']
+                    roll = data_dict['roll']
+                    
+                    # 应用倾角补偿
+                    x_comp, y_comp = self.app_instance.tilt_compensation(mag_x, mag_y, mag_z, pitch, roll)
+                    
+                    # 应用校准参数
+                    x_cal = (x_comp * self.app_instance.scale_x) - self.app_instance.center_x
+                    y_cal = (y_comp * self.app_instance.scale_y) - self.app_instance.center_y
+                    
+                    # 存储数据点
+                    self.realtime_data.append({
+                        'raw': (mag_x, mag_y),
+                        'calibrated': (x_cal, y_cal)
+                    })
+                    
+                    # 限制数据点数量
+                    if len(self.realtime_data) > 100:
+                        self.realtime_data.pop(0)
+                        
+                    # 更新散点图数据
+                    raw_x = [d['raw'][0] for d in self.realtime_data]
+                    raw_y = [d['raw'][1] for d in self.realtime_data]
+                    cal_x = [d['calibrated'][0] for d in self.realtime_data]
+                    cal_y = [d['calibrated'][1] for d in self.realtime_data]
+                    
+                    self.scatter_raw.set_offsets(np.column_stack([raw_x, raw_y]))
+                    self.scatter_cal.set_offsets(np.column_stack([cal_x, cal_y]))
+                    
+                    # 重绘图
+                    self.realtime_fig.canvas.draw_idle()
+                    
+        except Exception as e:
+            print(f"Realtime error: {e}")
+            
+    # 在closeEvent中添加清理
+    def closeEvent(self, event):
+        if self.realtime_active:
+            self.stop_realtime()
+        if self.app_instance:
+            self.app_instance.stop()
+        event.accept()
+
     def refresh_ports(self):
         """刷新可用串口列表"""
         self.port_combo.clear()
@@ -96,12 +277,13 @@ class CompassUI(QWidget):
             self.port_combo.addItem("No ports available")
             self.status_label.setText("Status: No serial ports found")
 
-    def start_calibration(self):
-        """开始校准流程"""
+    def start_calibration(self, connect_only=False):
+        """开始校准流程，增加connect_only参数"""
         selected_port = self.port_combo.currentText()
         if not selected_port or "No ports" in selected_port:
-            QMessageBox.warning(self, "Port Error", "Please select a valid serial port")
-            return
+            if not connect_only:
+                QMessageBox.warning(self, "Port Error", "Please select a valid serial port")
+            return False
             
         # 清理之前的实例
         if self.app_instance:
@@ -114,11 +296,13 @@ class CompassUI(QWidget):
         self.app_instance = CompassApp(selected_port, baud_rate)
         
         # 连接串口
-        if not self.app_instance.connect_serial():
-            QMessageBox.critical(self, "Connection Error", 
-                                f"Failed to connect to {selected_port} at {baud_rate} baud")
-            self.app_instance = None
-            return
+        if not self.app_instance.connect_serial(connect_only):
+            if not connect_only:
+                QMessageBox.critical(self, "Connection Error", 
+                                    f"Failed to connect to {selected_port} at {baud_rate} baud")
+            return False
+            
+        # return True
             
         # 启动校准
         self.calibration_button.setEnabled(False)
@@ -133,6 +317,8 @@ class CompassUI(QWidget):
         self.calibration_timer = QTimer(self)
         self.calibration_timer.timeout.connect(self.update_calibration_timer)
         self.calibration_timer.start(1000)
+
+        return True  # 成功启动时返回True（可选）
 
     def update_calibration_timer(self):
         """更新校准计时器"""

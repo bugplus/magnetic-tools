@@ -1,11 +1,47 @@
-# config.py
-PORT = 'COM4'               # 默认串口号
-BAUD_RATE = 115200          # 波特率
-TIMEOUT = 1                 # 串口超时时间
-UPDATE_INTERVAL = 50        # 更新间隔（毫秒）
-MAX_POINTS = 600            # 最大数据点数
-CALIBRATION_DURATION = 30   # 采集持续时间（秒）
-TOLERANCE_THRESHOLD = 1     # 点的容忍阈值，单位：像素
-# 添加以下参数
-REALTIME_UPDATE_INTERVAL = 100  # 实时更新间隔(毫秒)
-MAX_REALTIME_POINTS = 100       # 实时显示的最大点数
+"""
+File: config.py
+Purpose: System configuration parameters
+Description: Contains all key configuration parameters for the system
+"""
+
+class Config:
+    # Serial port configuration
+    PORT = 'COM3'
+    BAUD_RATE = 115200
+    TIMEOUT = 1
+    
+    # Data collection configuration
+    UPDATE_INTERVAL = 100        # Update interval (ms)
+    MAX_POINTS = 300             # Maximum data points
+    CALIBRATION_DURATION = 30    # Calibration duration (seconds)
+    
+    # Real-time mode configuration
+    REALTIME_UPDATE_INTERVAL = 100  # Real-time update interval (ms)
+    MAX_REALTIME_POINTS = 100       # Maximum points for real-time display
+    
+    # Unified color scheme
+    COLORS = {
+        "raw": "#FF0000",       # Red - raw data
+        "scaled": "#0000FF",    # Blue - scaled data
+        "calibrated": "#00FF00" # Green - calibrated data
+    }
+    
+    # Plot configuration
+    PLOT_TITLES = {
+        "raw_data": "Raw Data (Fig1)",
+        "scaled_data": "Scaled Data (Fig2)",
+        "calibrated_data": "Calibrated Data (Fig3)",
+        "analysis_raw": "Raw Data",
+        "analysis_calibrated": "Calibrated Data",
+        "realtime_raw": "Realtime Raw Data",
+        "realtime_calibrated": "Realtime Calibrated Data"
+    }
+    
+    # Axis range configuration
+    AXIS_LIMITS = {
+        "raw": (-1000, 1000),     # Raw data axis range
+        "calibrated": (-500, 500)  # Calibrated data axis range
+    }
+
+# Global configuration instance
+config = Config()

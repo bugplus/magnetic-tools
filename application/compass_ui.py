@@ -47,6 +47,7 @@ class CompassMainWindow(QMainWindow):
         port_layout.addWidget(self.port_combo)
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["9600", "115200"])
+        self.baud_combo.setCurrentText("115200")
         port_layout.addWidget(QLabel("波特率:"))
         port_layout.addWidget(self.baud_combo)
         self.refresh_btn = QPushButton("刷新串口")
@@ -56,7 +57,7 @@ class CompassMainWindow(QMainWindow):
 
         # 控制按钮
         btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("开始校准")
+        self.start_btn = QPushButton("Start Calibration")
         self.start_btn.clicked.connect(self.on_start)
         btn_layout.addWidget(self.start_btn)
         self.view_btn = QPushButton("View Result")

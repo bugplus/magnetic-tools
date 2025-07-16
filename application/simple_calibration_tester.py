@@ -21,6 +21,11 @@ def list_serial_ports():
 
 # ========== 倾角补偿 ==========
 def tilt_compensate(mx, my, mz, pitch, roll):
+    """
+    倾角补偿：将三轴磁力计数据根据pitch/roll旋转到水平面
+    输入：mx, my, mz (磁力计三轴数据), pitch, roll (弧度)
+    输出：补偿后的水平面磁力计数据 mx_comp, my_comp
+    """
     mx_comp = mx * math.cos(pitch) + mz * math.sin(pitch)
     my_comp = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
     return mx_comp, my_comp
@@ -50,6 +55,11 @@ def calibrate_2d_ellipse(xy):
 
 # ========== heading计算 ==========
 def calculate_heading(mx, my):
+    """
+    计算方位角（heading）
+    输入：水平面磁力计数据 mx, my
+    输出：方位角（度，0-360）
+    """
     heading_rad = math.atan2(-my, mx)
     heading_deg = math.degrees(heading_rad)
     if heading_deg < 0:
@@ -60,6 +70,22 @@ def heading_array(mx, my):
     headings = np.degrees(np.arctan2(-my, mx))
     headings[headings < 0] += 360
     return headings
+
+def fit_ellipse(xy):
+    cov = np.cov(xy.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    theta = np.arctan2(eigvecs[1,0], eigvecs[0,0])
+    a = np.sqrt(eigvals[0])
+    b = np.sqrt(eigvals[1])
+    return theta, a, b
+
+def rotate(xy, theta):
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                  [np.sin(theta),  np.cos(theta)]])
+    return xy @ R.T
 
 # ========== 串口读取线程 ==========
 class SerialReader(QObject, threading.Thread):
@@ -361,42 +387,51 @@ class SimpleCalibrationTester(QWidget):
             if len(self.data_level) < 30 or len(self.data_30deg) < 30:
                 self.result_text.setText("请先采集足够的水平和30度数据（每组建议不少于30条）！")
                 return
-            # 1. 倾角补偿
+            # 1. 倾角补偿（先修正磁力计坐标系）
             data1 = np.array(self.data_level)
             data2 = np.array(self.data_30deg)
             mx1, my1, mz1, pitch1, roll1 = data1.T
             mx2, my2, mz2, pitch2, roll2 = data2.T
             mxh1, myh1 = [], []
             for i in range(len(mx1)):
-                x, y = tilt_compensate(mx1[i], my1[i], mz1[i], pitch1[i], roll1[i])
+                mx_corr = -mx1[i]
+                my_corr = -my1[i]
+                mz_corr = mz1[i]
+                x, y = tilt_compensate(mx_corr, my_corr, mz_corr, pitch1[i], roll1[i])
                 mxh1.append(x)
                 myh1.append(y)
             mxh2, myh2 = [], []
             for i in range(len(mx2)):
-                x, y = tilt_compensate(mx2[i], my2[i], mz2[i], pitch2[i], roll2[i])
+                mx_corr = -mx2[i]
+                my_corr = -my2[i]
+                mz_corr = mz2[i]
+                x, y = tilt_compensate(mx_corr, my_corr, mz_corr, pitch2[i], roll2[i])
                 mxh2.append(x)
                 myh2.append(y)
             mxh = np.concatenate([mxh1, mxh2])
             myh = np.concatenate([myh1, myh2])
             xy = np.stack([mxh, myh], axis=1)
-            # 2. 二维椭圆拟合
-            calibrated, center, scale = calibrate_2d_ellipse(xy)
+            # 2. 椭圆拟合+旋转+缩放（软铁补偿，不做硬铁补偿）
+            theta, a, b = fit_ellipse(xy)
+            xy_rot = rotate(xy, -theta)
+            xy_calib = xy_rot.copy()
+            xy_calib[:,1] *= a / b
             # 3. 分组heading
             n1 = len(mxh1)
             n2 = len(mxh2)
-            cal1 = calibrated[:n1]
-            cal2 = calibrated[n1:]
-            heading1 = heading_array(cal1[:,0], cal1[:,1])
-            heading2 = heading_array(cal2[:,0], cal2[:,1])
+            cal1 = xy_calib[:n1]
+            cal2 = xy_calib[n1:]
+            heading1 = np.array([calculate_heading(x, y) for x, y in cal1])
+            heading2 = np.array([calculate_heading(x, y) for x, y in cal2])
             mean1 = np.mean(heading1)
             mean2 = np.mean(heading2)
             heading_drift = abs(mean1 - mean2)
             # 4. 输出结果
             result = f"水平均值: {mean1:.2f}°\n30度均值: {mean2:.2f}°\nheading_drift: {heading_drift:.2f}°\n"
             if heading_drift < 3:
-                result += "\n结论：适合二维校准量产！"
+                result += "\n结论：适合二维校准量产！（椭圆软铁补偿+坐标系修正）"
             else:
-                result += "\n结论：建议升级三轴椭球拟合或优化安装！"
+                result += "\n结论：建议升级三轴椭球拟合或优化安装！（椭圆软铁补偿+坐标系修正）"
             self.result_text.setText(result)
         except Exception as e:
             self.result_text.setText(f"测试异常: {e}")

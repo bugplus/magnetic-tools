@@ -363,84 +363,56 @@ class SimpleCalibrationTester(QWidget):
 
     def run_test(self):
         try:
-            if len(self.data_level) < 10:
-                self.result_text.setText("请先采集至少10条水平数据！")
+            if len(self.data_level) < 30:
+                self.result_text.setText("请先采集至少30条旋转数据！")
                 return
 
-            data1 = np.array(self.data_level)
-            mx1, my1, mz1, pitch1, roll1 = data1.T
-
-            # 调试输出：原始数据统计
-            debug_info = f"=== 原始数据统计 ===\n"
-            debug_info += f"水平数据: mx范围[{np.min(mx1):.1f}, {np.max(mx1):.1f}], my范围[{np.min(my1):.1f}, {np.max(my1):.1f}], mz范围[{np.min(mz1):.1f}, {np.max(mz1):.1f}]\n"
-            debug_info += f"水平数据: pitch范围[{np.min(pitch1):.1f}°, {np.max(pitch1):.1f}°], roll范围[{np.min(roll1):.1f}°, {np.max(roll1):.1f}°]\n"
-
-            # 角度转弧度
-            pitch1 = np.radians(pitch1)
-            roll1 = np.radians(roll1)
+            data = np.array(self.data_level)
+            mx, my, mz, pitch, roll = data.T
+            pitch = np.radians(pitch)
+            roll = np.radians(roll)
 
             # 倾角补偿
-            mxh1, myh1 = [], []
-            for i in range(len(mx1)):
-                mx_corr = mx1[i]
-                my_corr = my1[i]
-                mz_corr = mz1[i]
-                x, y = tilt_compensate(mx_corr, my_corr, mz_corr, pitch1[i], roll1[i])
-                mxh1.append(x)
-                myh1.append(y)
-            mxh1 = np.array(mxh1)
-            myh1 = np.array(myh1)
-
-            debug_info += f"\n=== 倾角补偿后数据 ===\n"
-            debug_info += f"水平补偿后: mx范围[{np.min(mxh1):.1f}, {np.max(mxh1):.1f}], my范围[{np.min(myh1):.1f}, {np.max(myh1):.1f}]\n"
+            mxh, myh = [], []
+            for i in range(len(mx)):
+                x, y = tilt_compensate(mx[i], my[i], mz[i], pitch[i], roll[i])
+                mxh.append(x)
+                myh.append(y)
+            mxh = np.array(mxh)
+            myh = np.array(myh)
 
             # 椭圆拟合
-            xy = np.stack([mxh1, myh1], axis=1)
+            xy = np.stack([mxh, myh], axis=1)
             theta, a, b = fit_ellipse(xy)
             xy_rot = rotate(xy, -theta)
             xy_calib = xy_rot.copy()
             xy_calib[:,1] *= a / b
             center = np.mean(xy_calib, axis=0)
+            hard_iron_offset = np.sqrt(center[0]**2 + center[1]**2)
+            soft_iron_ratio = a / b
 
-            debug_info += f"\n=== 椭圆拟合结果 ===\n"
-            debug_info += f"椭圆参数: a={a:.2f}, b={b:.2f}, theta={np.degrees(theta):.2f}°\n"
-            debug_info += f"软铁比例: a/b={a/b:.3f}\n"
-            debug_info += f"硬铁偏移: center=({center[0]:.2f}, {center[1]:.2f})\n"
-            debug_info += f"硬铁偏移大小: {np.sqrt(center[0]**2 + center[1]**2):.2f}\n"
-
-            # heading方案对比
-            debug_info += f"\n=== 静止数据heading方案对比（前10组） ===\n"
-            for i in range(min(10, len(mxh1))):
-                mx, my = mxh1[i], myh1[i]
-                yaw = data1[i, 4] if data1.shape[1] > 4 else 0
-                h1, h2, h3, h4, h5 = heading_schemes(mx, my)
-                debug_info += f"yaw={yaw:.2f}, h1={h1:.2f}, h2={h2:.2f}, h3={h3:.2f}, h4={h4:.2f}, h5={h5:.2f}\n"
-
-            heading1 = np.array([calculate_heading(x, y) for x, y in xy_calib])
-            heading_std = np.std(heading1)
-
-            debug_info += f"\n=== Heading计算结果 ===\n"
-            debug_info += f"水平heading: 均值={np.mean(heading1):.2f}°, 标准差={heading_std:.2f}°\n"
-
-            # 评估结论
-            result = debug_info + f"\n=== 最终结论 ===\n"
-            result += f"水平均值: {np.mean(heading1):.2f}°\n"
+            # 调试输出
+            result = f"=== 旋转校准结果 ===\n"
+            result += f"采集数据量: {len(mx)}\n"
+            result += f"软铁比例(a/b): {soft_iron_ratio:.3f}\n"
+            result += f"硬铁偏移(center/长轴): {hard_iron_offset/a:.3f}\n"
             result += f"椭圆参数: a={a:.2f}, b={b:.2f}, theta={np.degrees(theta):.2f}°\n"
-            result += f"硬铁偏移: center=({center[0]:.2f}, {center[1]:.2f})\n"
-            result += f"硬铁偏移大小: {np.sqrt(center[0]**2 + center[1]**2):.2f}\n"
+            result += f"硬铁偏移: center=({center[0]:.2f}, {center[1]:.2f}), 大小={hard_iron_offset:.2f}\n"
 
-            if heading_std < 2:
-                result += "\n结论：环境干净，无需硬铁矫正！"
-            elif heading_std < 5:
-                result += f"\n结论：环境有轻微干扰({heading_std:.1f}°)，建议做硬铁矫正。"
+            # 分档评估
+            if 0.75 < soft_iron_ratio < 1.3 and hard_iron_offset/a < 0.3:
+                result += "\n结论：环境优秀，适合做软铁/硬铁校准！"
+            elif 0.6 < soft_iron_ratio < 1.5 and hard_iron_offset/a < 0.5:
+                result += "\n结论：环境良好，校准后可用。"
             else:
-                result += f"\n结论：环境有强干扰({heading_std:.1f}°)，必须做硬铁矫正！"
+                result += "\n结论：环境有较强干扰，校准效果可能受影响。"
 
             self.result_text.setText(result)
         except Exception as e:
-            self.result_text.setText(f"测试异常: {e}")
+            self.result_text.setText(f"校准异常: {e}")
             import traceback
             traceback.print_exc()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

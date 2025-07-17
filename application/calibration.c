@@ -2,8 +2,8 @@
 // Auto-generated calibration code
 void calibrate(float* x, float* y) {
     // Hard iron offset
-    *x -= -11.193189f;
-    *y -= -34.088797f;
+    *x -= 32.788931f;
+    *y -= 6.571429f;
     // Soft iron scale
-    *y *= 1.211562f;
+    *y *= 0.980909f;
 }

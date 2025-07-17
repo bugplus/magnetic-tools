@@ -13,23 +13,23 @@ CALIBRATION_DURATION = 30  # seconds
 
 class SerialReader(threading.Thread):
     def __init__(self, port, baudrate, callback):
-        super().__init__()
+        threading.Thread.__init__(self)
         self.port = port
         self.baudrate = baudrate
         self.callback = callback
         self.running = False
-
     def run(self):
         self.running = True
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
             while self.running:
-                line = ser.readline().decode(errors='ignore').strip()
-                if 'mag_x' in line:
+                try:
+                    line = ser.readline().decode(errors='ignore')
                     self.callback(line)
+                except Exception as e:
+                    print(f"Serial read error: {e}")
         except Exception as e:
-            print("Serial error:", e)
-
+            print(f"Serial error: {e}")
     def stop(self):
         self.running = False
 
@@ -107,7 +107,7 @@ class CalibrationApp:
         self.window.start_calibration_signal.connect(self.start_calibration)
         self.window.view_result_signal.connect(self.view_result)
         self.serial_thread = None
-        self.raw_mag_data = []
+        self.raw_mag_data = []  # [mx, my, mz, roll, pitch, yaw]
         self.calibrated = False
         self.calibration_params = None
         self.fig = None
@@ -115,6 +115,7 @@ class CalibrationApp:
         self.ax_shifted = None
         self.ax_calibrated = None
         self.raw_plot = None
+        self._pending_mag = None  # 用于暂存mag行
 
     def start_calibration(self, port, baudrate):
         try:
@@ -158,18 +159,31 @@ class CalibrationApp:
     def extract_mag(self, mag_line):
         return [float(x) for x in re.findall(r'-?\d+\.?\d*', mag_line)]
 
-    def on_serial_data(self, mag_line):
-        mag_values = self.extract_mag(mag_line)
-        if len(mag_values) >= 2:
-            self.raw_mag_data.append(mag_values[:2])
-            if self.ax_raw is not None and self.raw_plot is not None:
-                data = np.array(self.raw_mag_data)
-                self.raw_plot.set_data(data[:, 0], data[:, 1])
-                self.ax_raw.relim()
-                self.ax_raw.autoscale_view()
-                if self.fig is not None:
-                    self.fig.canvas.draw_idle()
-                    self.fig.canvas.flush_events()
+    def on_serial_data(self, line):
+        # 参考simple_calibration_tester.py的逻辑
+        if not line.strip():
+            return
+        if line.startswith('mag_x='):
+            vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
+            if vals:
+                mx, my, mz = map(float, vals[0])
+                mx, my = -mx, -my  # 坐标系修正
+                self._pending_mag = (mx, my, mz)
+        elif line.startswith('roll='):
+            vals = re.findall(r'roll=\s*([\-\d\.]+),\s*pitch=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
+            if vals and self._pending_mag is not None:
+                roll, pitch, yaw = map(float, vals[0])
+                mx, my, mz = self._pending_mag
+                self.raw_mag_data.append([mx, my, mz, roll, pitch, yaw])
+                self._pending_mag = None
+                arr = np.array(self.raw_mag_data)
+                if arr.shape[0] > 0 and self.raw_plot is not None and self.ax_raw is not None:
+                    self.raw_plot.set_data(arr[:, 0], arr[:, 1])
+                    self.ax_raw.relim()
+                    self.ax_raw.autoscale_view()
+                    if self.fig is not None:
+                        self.fig.canvas.draw_idle()
+                        self.fig.canvas.flush_events()
 
     def perform_calibration(self):
         self.window.set_status("Calibration finished. Processing data...")
@@ -180,48 +194,56 @@ class CalibrationApp:
             self.window.baud_combo.setEnabled(True)
             self.window.refresh_btn.setEnabled(True)
             return
-        data = np.array(self.raw_mag_data)
-        # 1. Fit center of raw data
-        raw_center, _ = fit_circle_least_squares(data)
+        arr = np.array(self.raw_mag_data)
+        mx, my, mz, roll, pitch, yaw = arr.T
+        # 倾角补偿（pitch/roll转弧度）
+        roll = np.radians(roll)
+        pitch = np.radians(pitch)
+        mxh, myh = [], []
+        for i in range(len(mx)):
+            # 标准倾角补偿公式
+            mx_comp = mx[i] * np.cos(pitch[i]) + mz[i] * np.sin(pitch[i])
+            my_comp = mx[i] * np.sin(roll[i]) * np.sin(pitch[i]) + my[i] * np.cos(roll[i]) - mz[i] * np.sin(roll[i]) * np.cos(pitch[i])
+            mxh.append(mx_comp)
+            myh.append(my_comp)
+        xy = np.stack([mxh, myh], axis=1)
+        # 椭圆拟合（软/硬铁补偿）
+        raw_center, _ = fit_circle_least_squares(xy)
         a, b = raw_center
-        # 2. Soft iron: scale y about the center (not the origin)
-        radius_x = (np.max(data[:, 0] - a))
-        radius_y = (np.max(data[:, 1] - b))
+        radius_x = (np.max(xy[:, 0] - a))
+        radius_y = (np.max(xy[:, 1] - b))
         scale = radius_x / radius_y if radius_y != 0 else 1.0
-        soft_calibrated = data.copy()
+        soft_calibrated = xy.copy()
         soft_calibrated[:, 0] = a + (soft_calibrated[:, 0] - a)
         soft_calibrated[:, 1] = b + (soft_calibrated[:, 1] - b) * scale
-        # 3. Fit center after scaling, then shift to origin (hard iron)
         center_after_soft, _ = fit_circle_least_squares(soft_calibrated)
         final_calibrated = soft_calibrated - center_after_soft
-        # 过滤偏离圆心过大的异常点
         dist = np.linalg.norm(final_calibrated, axis=1)
         median_dist = np.median(dist)
         std_dist = np.std(dist)
         mask = np.abs(dist - median_dist) < 3 * std_dist
         filtered_final_calibrated = final_calibrated[mask]
-        filtered_data = data[mask]
+        filtered_xy = xy[mask]
         # Plotting
         if self.ax_shifted is not None:
             self.ax_shifted.cla()
             self.ax_shifted.set_title("Soft Iron Calibrated (center unchanged)")
             self.ax_shifted.axis('equal')
             self.ax_shifted.plot(soft_calibrated[:, 0], soft_calibrated[:, 1], 'r.', alpha=0.7)
-            self.ax_shifted.plot(a, b, 'rx', markersize=10, mew=2)  # Center should be unchanged
+            self.ax_shifted.plot(a, b, 'rx', markersize=10, mew=2)
             self.ax_shifted.plot(0, 0, 'k+', markersize=10, mew=2)
         if self.ax_calibrated is not None:
             self.ax_calibrated.cla()
             self.ax_calibrated.set_title(f"Final Calibrated\nScale: {scale:.4f}")
             self.ax_calibrated.axis('equal')
             self.ax_calibrated.plot(filtered_final_calibrated[:, 0], filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
-            self.ax_calibrated.plot(0, 0, 'rx', markersize=10, mew=2)  # Center now at origin
+            self.ax_calibrated.plot(0, 0, 'rx', markersize=10, mew=2)
             self.ax_calibrated.plot(0, 0, 'k+', markersize=10, mew=2)
         if self.ax_raw is not None:
             self.ax_raw.plot(0, 0, 'k+', markersize=10, mew=2)
             self.ax_raw.plot(a, b, 'rx', markersize=10, mew=2)
-        # 设置三个子图的坐标范围和比例一致，消除视觉误差
         R = max(
-            np.abs(filtered_data[:, 0]).max(), np.abs(filtered_data[:, 1]).max(),
+            np.abs(filtered_xy[:, 0]).max(), np.abs(filtered_xy[:, 1]).max(),
             np.abs(soft_calibrated[:, 0]).max(), np.abs(soft_calibrated[:, 1]).max(),
             np.abs(filtered_final_calibrated[:, 0]).max(), np.abs(filtered_final_calibrated[:, 1]).max()
         )
@@ -235,7 +257,7 @@ class CalibrationApp:
             self.fig.canvas.flush_events()
         self.window.set_status("Calibration finished. Click View Result to see results.")
         self.window.enable_view_btn(True)
-        self.calibration_params = (center_after_soft, scale, filtered_data, filtered_final_calibrated)
+        self.calibration_params = (center_after_soft, scale, filtered_xy, filtered_final_calibrated)
         self.window.start_btn.setEnabled(True)
         self.window.port_combo.setEnabled(True)
         self.window.baud_combo.setEnabled(True)

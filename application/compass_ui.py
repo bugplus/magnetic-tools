@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import pyqtSignal
 import serial.tools.list_ports
+import re
 
 class ResultDialog(QDialog):
     def __init__(self, c_code, parent=None):
@@ -37,7 +38,7 @@ class CompassMainWindow(QMainWindow):
         self.resize(600, 200)
         self.central = QWidget()
         self.setCentralWidget(self.central)
-        main_layout = QVBoxLayout(self.central)
+        self.main_layout = QVBoxLayout(self.central)
 
         # 串口选择区
         port_layout = QHBoxLayout()
@@ -53,7 +54,7 @@ class CompassMainWindow(QMainWindow):
         self.refresh_btn = QPushButton("刷新串口")
         self.refresh_btn.clicked.connect(self.refresh_ports)
         port_layout.addWidget(self.refresh_btn)
-        main_layout.addLayout(port_layout)
+        self.main_layout.addLayout(port_layout)
 
         # 控制按钮
         btn_layout = QHBoxLayout()
@@ -64,11 +65,11 @@ class CompassMainWindow(QMainWindow):
         self.view_btn.clicked.connect(self.on_view_result)
         self.view_btn.setEnabled(False)
         btn_layout.addWidget(self.view_btn)
-        main_layout.addLayout(btn_layout)
+        self.main_layout.addLayout(btn_layout)
 
         # 状态栏
         self.status_label = QLabel("请连接设备并选择串口")
-        main_layout.addWidget(self.status_label)
+        self.main_layout.addWidget(self.status_label)
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -97,6 +98,14 @@ class CompassMainWindow(QMainWindow):
 
     def set_status(self, text):
         self.status_label.setText(text)
+
+    def show_serial_line(self, line):
+        # 新增：在状态栏下方显示串口原始数据
+        if not hasattr(self, '_serial_label'):
+            from PyQt5.QtWidgets import QLabel
+            self._serial_label = QLabel()
+            self.main_layout.addWidget(self._serial_label)
+        self._serial_label.setText(f'串口数据: {line}')
 
     def clear_all_canvases(self):
         pass  # 兼容旧接口，无实际操作

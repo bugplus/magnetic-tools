@@ -12,7 +12,7 @@ import math
 from collections import deque
 import csv
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 # ========== 串口扫描工具 ==========
 def list_serial_ports():
@@ -21,13 +21,9 @@ def list_serial_ports():
 
 # ========== 倾角补偿 ==========
 def tilt_compensate(mx, my, mz, pitch, roll):
-    """
-    倾角补偿：将三轴磁力计数据根据pitch/roll旋转到水平面
-    输入：mx, my, mz (磁力计三轴数据), pitch, roll (弧度)
-    输出：补偿后的水平面磁力计数据 mx_comp, my_comp
-    """
-    mx_comp = mx * math.cos(pitch) + mz * math.sin(pitch)
-    my_comp = mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll) - mz * math.sin(roll) * math.cos(pitch)
+    # 标准三轴磁力计倾角补偿
+    mx_comp = mx * np.cos(pitch) + mz * np.sin(pitch)
+    my_comp = mx * np.sin(roll) * np.sin(pitch) + my * np.cos(roll) - mz * np.sin(roll) * np.cos(pitch)
     return mx_comp, my_comp
 
 # ========== 二维椭圆拟合 ==========
@@ -45,7 +41,7 @@ def calibrate_2d_ellipse(xy):
     # 软铁：y轴缩放到x轴半径
     radius_x = (np.max(xy[:, 0]) - np.min(xy[:, 0])) / 2
     radius_y = (np.max(xy[:, 1]) - np.min(xy[:, 1])) / 2
-    scale = radius_x / radius_y if radius_y != 0 else 1.0
+    scale = radius_x / radius_y if radius_y != 0 else 10
     soft_calibrated = xy.copy()
     soft_calibrated[:, 1] *= scale
     # 硬铁：拟合圆心，平移到原点
@@ -54,17 +50,19 @@ def calibrate_2d_ellipse(xy):
     return calibrated, center, scale
 
 # ========== heading计算 ==========
+def heading_schemes(mx, my):
+    import math
+    # 返回所有常见heading方案
+    h1 = (math.degrees(math.atan2(-my, mx)) + 360) % 360
+    h2 = (math.degrees(math.atan2(my, mx)) + 360) % 360
+    h3 = (math.degrees(math.atan2(mx, my)) + 360) % 360
+    h4 = (math.degrees(math.atan2(-my, -mx)) + 360) % 360
+    h5 = (math.degrees(math.atan2(my, -mx)) + 360) % 360
+    return h1, h2, h3, h4, h5
+
 def calculate_heading(mx, my):
-    """
-    计算方位角（heading）
-    输入：水平面磁力计数据 mx, my
-    输出：方位角（度，0-360）
-    """
-    heading_rad = math.atan2(-my, mx)
-    heading_deg = math.degrees(heading_rad)
-    if heading_deg < 0:
-        heading_deg += 360
-    return heading_deg
+    # 默认用方案1
+    return (math.degrees(math.atan2(-my, mx)) + 360) % 360
 
 def heading_array(mx, my):
     headings = np.degrees(np.arctan2(-my, mx))
@@ -77,14 +75,14 @@ def fit_ellipse(xy):
     order = np.argsort(eigvals)[::-1]
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
-    theta = np.arctan2(eigvecs[1,0], eigvecs[0,0])
+    theta = np.arctan2(eigvecs[0,0], eigvecs[0,1])
     a = np.sqrt(eigvals[0])
     b = np.sqrt(eigvals[1])
     return theta, a, b
 
 def rotate(xy, theta):
     R = np.array([[np.cos(theta), -np.sin(theta)],
-                  [np.sin(theta),  np.cos(theta)]])
+                [np.sin(theta),  np.cos(theta)]])
     return xy @ R.T
 
 # ========== 串口读取线程 ==========
@@ -103,12 +101,12 @@ class SerialReader(QObject, threading.Thread):
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
             while self.running:
                 try:
-                    line = ser.readline().decode(errors='ignore').strip()
+                    line = ser.readline().decode(errors='ignore')
                     self.callback(line)  # 任何行都传递
                 except Exception as e:
-                    print("Serial read error:", e)
+                    print(f"Serial read error: {e}")
         except Exception as e:
-            print("Serial error:", e)
+            print(f"Serial error: {e}")
     def stop(self):
         self.running = False
 
@@ -119,7 +117,7 @@ class SimpleCalibrationTester(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("简易地磁二维校准验证工具")
-        self.resize(500, 400)
+        self.resize(500,400)
         self.main_layout = QVBoxLayout()
         self.setLayout(self.main_layout)
 
@@ -139,10 +137,10 @@ class SimpleCalibrationTester(QWidget):
         # 按钮
         btn_box = QHBoxLayout()
         self.btn_level = QPushButton("采集水平数据")
-        self.btn_30deg = QPushButton("采集30度数据")
+        self.btn_30eg = QPushButton("采集30度数据")
         self.btn_test = QPushButton("测试")
         btn_box.addWidget(self.btn_level)
-        btn_box.addWidget(self.btn_30deg)
+        btn_box.addWidget(self.btn_30eg)
         btn_box.addWidget(self.btn_test)
         self.main_layout.addLayout(btn_box)
 
@@ -155,9 +153,9 @@ class SimpleCalibrationTester(QWidget):
 
         # 数据缓存
         self.data_level = []
-        self.data_30deg = []
+        self.data_30 = []
         self.serial_thread = None
-        self.collecting = None  # 'level' or '30deg'
+        self.collecting = None  # 'level' or '30eg'
         self._pending_mag = None  # 用于暂存mag行
         self.data_log = []  # 新增：用于存储最近N条原始数据
         self.mag_queue = deque()
@@ -180,21 +178,21 @@ class SimpleCalibrationTester(QWidget):
         # 新增：导出数据按钮
         export_box = QHBoxLayout()
         self.btn_export_level = QPushButton("导出水平数据")
-        self.btn_export_30deg = QPushButton("导出30度数据")
+        self.btn_export_30eg = QPushButton("导出30度数据")
         self.btn_export_level.setEnabled(False)
-        self.btn_export_30deg.setEnabled(False)
+        self.btn_export_30eg.setEnabled(False)
         export_box.addWidget(self.btn_export_level)
-        export_box.addWidget(self.btn_export_30deg)
+        export_box.addWidget(self.btn_export_30eg)
         self.main_layout.addLayout(export_box)
         self.btn_export_level.clicked.connect(self.export_level_data)
-        self.btn_export_30deg.clicked.connect(self.export_30deg_data)
+        self.btn_export_30eg.clicked.connect(self.export_30deg_data)
 
         # 事件绑定
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.btn_level.clicked.connect(self.collect_level)
-        self.btn_30deg.clicked.connect(self.collect_30deg)
+        self.btn_30eg.clicked.connect(self.collect_30)
         self.btn_test.clicked.connect(self.run_test)
-        self.btn_30deg.setEnabled(False)
+        self.btn_30eg.setEnabled(False)
         self.btn_test.setEnabled(False)
         self.refresh_ports()
 
@@ -208,19 +206,19 @@ class SimpleCalibrationTester(QWidget):
         self.collecting = 'level'
         self.btn_level.setStyleSheet("background-color: yellow")
         self.btn_level.setEnabled(False)
-        self.btn_30deg.setEnabled(False)
+        self.btn_30eg.setEnabled(False)
         self.btn_test.setEnabled(False)
         self.start_serial_collection()
-        self.status_label.setText("状态: 采集水平数据中，请水平旋转1-2圈...")
+        self.status_label.setText("状态: 采集水平数据中，请水平旋转1")
 
-    def collect_30deg(self):
-        self.data_30deg.clear()
-        self.collecting = '30deg'
-        self.btn_30deg.setStyleSheet("background-color: yellow")
-        self.btn_30deg.setEnabled(False)
+    def collect_30(self):
+        self.data_30.clear()
+        self.collecting = '30'
+        self.btn_30eg.setStyleSheet("background-color: yellow")
+        self.btn_30eg.setEnabled(False)
         self.btn_test.setEnabled(False)
         self.start_serial_collection()
-        self.status_label.setText("状态: 采集30度倾斜数据中，请倾斜30°旋转1-2圈...")
+        self.status_label.setText("状态: 采集30度倾斜数据中，请倾斜301.")
 
     def start_serial_collection(self):
         if self.serial_thread:
@@ -231,20 +229,12 @@ class SimpleCalibrationTester(QWidget):
         self.serial_thread = SerialReader(port, baud, self.on_serial_data)
         self.serial_thread.daemon = True
         self.serial_thread.start()
-        # 移除自动3秒停采逻辑
-        # threading.Thread(target=self._auto_stop, daemon=True).start()
-
-    def _auto_stop(self):
-        time.sleep(3)
-        if self.serial_thread:
-            self.serial_thread.stop()
-        self.status_label.setText("状态: 采集完成，可进行下一步")
 
     def export_level_data(self):
         self.save_data_to_csv(self.data_level, "水平数据.csv")
 
     def export_30deg_data(self):
-        self.save_data_to_csv(self.data_30deg, "30度数据.csv")
+        self.save_data_to_csv(self.data_30, "30度数据.csv")
 
     def save_data_to_csv(self, data, filename_hint):
         path, _ = QFileDialog.getSaveFileName(self, "保存数据", filename_hint, "CSV Files (*.csv)")
@@ -281,14 +271,14 @@ class SimpleCalibrationTester(QWidget):
                 keep.append(np.where(mask)[0][i])
         return arr[keep]
 
-    def check_distribution_uniform(self, arr, bins=36, min_bins=36, min_radius=20):  # 调小阈值
+    def check_distribution_uniform(self, arr, bins=36, min_bins=36, min_radius=20):
         if len(arr) == 0:
             return False
         x, y = arr[:,0], arr[:,1]
         theta = np.arctan2(y, x)
         r = np.sqrt(x**2 + y**2)
         bin_edges = np.linspace(-np.pi, np.pi, bins+1)
-        idx = np.digitize(theta, bin_edges) - 1
+        idx = np.digitize(theta, bin_edges) -1
         covered_bins = set(idx[(r > min_radius)])
         return len(covered_bins) >= min_bins
 
@@ -303,58 +293,55 @@ class SimpleCalibrationTester(QWidget):
 
     def on_serial_data(self, line):
         try:
-            self.append_text_signal.emit(line)  # 用信号发到主线程
-            if not line.strip() or line.strip() == 'mag':
+            self.append_text_signal.emit(line)
+            if not line.strip():
                 return
-            if 'mag_x' in line:
-                vals = [float(x) for x in re.findall(r'-?\d+\.?\d*', line)]
-                if len(vals) == 3:
-                    self.mag_queue.append(vals)
-            elif 'pitch' in line:
-                vals = [float(x) for x in re.findall(r'-?\d+\.?\d*', line)]
-                if len(vals) >= 2:
-                    self.pitch_queue.append(vals)
-            # 队列配对采集
-            while self.mag_queue and self.pitch_queue:
-                try:
-                    mag_vals = self.mag_queue.popleft()
-                    pitch_vals = self.pitch_queue.popleft()
-                    mx, my, mz = mag_vals
-                    pitch, roll = pitch_vals[0], pitch_vals[1]
-                    row = [mx, my, mz, pitch, roll]
+            # 新格式：mag_x=...在前，roll=...在后
+            if line.startswith('mag_x='):
+                vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
+                if vals:
+                    mx, my, mz = map(float, vals[0])
+                    self._pending_mag = (mx, my, mz)
+            elif line.startswith('roll='):
+                vals = re.findall(r'roll=\s*([\-\d\.]+),\s*pitch=\s*([\-\d\.]+)', line)
+                if vals and hasattr(self, '_pending_mag') and self._pending_mag is not None:
+                    roll, pitch = map(float, vals[0])
+                    mx, my, mz = self._pending_mag
+                    row = (mx, my, mz, pitch, roll)
                     if self.collecting == 'level':
                         self.data_level.append(row)
                         self.update_scatter(self.data_level)
                         arr = np.array(self.data_level)
+                        # 放宽条件：只要采集到10条就允许测试
+                        if len(self.data_level) >= 10:
+                            self.btn_test.setEnabled(True)
                         filtered = self.polar_bin_filter(arr[:, :2])
                         covered_bins = self.get_covered_bins(filtered)
                         self.status_label.setText(f"已采集{len(self.data_level)}条，已覆盖方向{covered_bins}/36")
-                        if self.check_distribution_uniform(filtered, bins=36, min_bins=36):
+                        if self.check_distribution_uniform(filtered, bins=36):
                             if self.serial_thread:
                                 self.serial_thread.stop()
-                            self.btn_30deg.setEnabled(True)
+                            self.btn_30eg.setEnabled(True)
                             self.btn_level.setEnabled(True)
                             self.btn_export_level.setEnabled(True)
                             self.collecting = None
-                    elif self.collecting == '30deg':
-                        self.data_30deg.append(row)
-                        self.update_scatter(self.data_30deg)
-                        arr = np.array(self.data_30deg)
+                    elif self.collecting == '30':
+                        self.data_30.append(row)
+                        self.update_scatter(self.data_30)
+                        arr = np.array(self.data_30)
+                        if len(self.data_30) >= 10:
+                            self.btn_test.setEnabled(True)
                         filtered = self.polar_bin_filter(arr[:, :2])
                         covered_bins = self.get_covered_bins(filtered)
-                        self.status_label.setText(f"已采集{len(self.data_30deg)}条，已覆盖方向{covered_bins}/36")
-                        if self.check_distribution_uniform(filtered, bins=36, min_bins=36):
+                        self.status_label.setText(f"已采集{len(self.data_30)}条，已覆盖方向{covered_bins}/36")
+                        if self.check_distribution_uniform(filtered, bins=36):
                             if self.serial_thread:
                                 self.serial_thread.stop()
                             self.btn_test.setEnabled(True)
-                            self.btn_30deg.setEnabled(True)
-                            self.btn_export_30deg.setEnabled(True)
+                            self.btn_30eg.setEnabled(True)
+                            self.btn_export_30eg.setEnabled(True)
                             self.collecting = None
-                except Exception as e:
-                    self.append_text_signal.emit(f"[配对异常] {e}")
-                    print("Pairing error:", e)
-                    import traceback
-                    traceback.print_exc()
+                    self._pending_mag = None  # 用完清空
         except Exception as e:
             self.append_text_signal.emit(f"[解析异常] {e}")
             print("Data parse error:", e)
@@ -363,75 +350,92 @@ class SimpleCalibrationTester(QWidget):
 
     def _append_data_text(self, line):
         import datetime
-        now = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.data_text.append(f"[{now}] {line}")
-        # 限制显示最近100条
+        # 限制显示最近100
         doc = self.data_text.document()
-        if doc.blockCount() > 100:
+        if doc and doc.blockCount() > 100:
             cursor = self.data_text.textCursor()
             cursor.movePosition(cursor.Start)
             cursor.select(cursor.LineUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
 
-    def collect_level_enable(self):
-        self.btn_level.setEnabled(True)
-        self.btn_level.setStyleSheet("")
-
-    def collect_30deg_enable(self):
-        self.btn_30deg.setEnabled(True)
-        self.btn_30deg.setStyleSheet("")
-
     def run_test(self):
         try:
-            if len(self.data_level) < 30 or len(self.data_30deg) < 30:
-                self.result_text.setText("请先采集足够的水平和30度数据（每组建议不少于30条）！")
+            if len(self.data_level) < 10:
+                self.result_text.setText("请先采集至少10条水平数据！")
                 return
-            # 1. 倾角补偿（先修正磁力计坐标系）
+
             data1 = np.array(self.data_level)
-            data2 = np.array(self.data_30deg)
             mx1, my1, mz1, pitch1, roll1 = data1.T
-            mx2, my2, mz2, pitch2, roll2 = data2.T
+
+            # 调试输出：原始数据统计
+            debug_info = f"=== 原始数据统计 ===\n"
+            debug_info += f"水平数据: mx范围[{np.min(mx1):.1f}, {np.max(mx1):.1f}], my范围[{np.min(my1):.1f}, {np.max(my1):.1f}], mz范围[{np.min(mz1):.1f}, {np.max(mz1):.1f}]\n"
+            debug_info += f"水平数据: pitch范围[{np.min(pitch1):.1f}°, {np.max(pitch1):.1f}°], roll范围[{np.min(roll1):.1f}°, {np.max(roll1):.1f}°]\n"
+
+            # 角度转弧度
+            pitch1 = np.radians(pitch1)
+            roll1 = np.radians(roll1)
+
+            # 倾角补偿
             mxh1, myh1 = [], []
             for i in range(len(mx1)):
-                mx_corr = -mx1[i]
-                my_corr = -my1[i]
+                mx_corr = mx1[i]
+                my_corr = my1[i]
                 mz_corr = mz1[i]
                 x, y = tilt_compensate(mx_corr, my_corr, mz_corr, pitch1[i], roll1[i])
                 mxh1.append(x)
                 myh1.append(y)
-            mxh2, myh2 = [], []
-            for i in range(len(mx2)):
-                mx_corr = -mx2[i]
-                my_corr = -my2[i]
-                mz_corr = mz2[i]
-                x, y = tilt_compensate(mx_corr, my_corr, mz_corr, pitch2[i], roll2[i])
-                mxh2.append(x)
-                myh2.append(y)
-            mxh = np.concatenate([mxh1, mxh2])
-            myh = np.concatenate([myh1, myh2])
-            xy = np.stack([mxh, myh], axis=1)
-            # 2. 椭圆拟合+旋转+缩放（软铁补偿，不做硬铁补偿）
+            mxh1 = np.array(mxh1)
+            myh1 = np.array(myh1)
+
+            debug_info += f"\n=== 倾角补偿后数据 ===\n"
+            debug_info += f"水平补偿后: mx范围[{np.min(mxh1):.1f}, {np.max(mxh1):.1f}], my范围[{np.min(myh1):.1f}, {np.max(myh1):.1f}]\n"
+
+            # 椭圆拟合
+            xy = np.stack([mxh1, myh1], axis=1)
             theta, a, b = fit_ellipse(xy)
             xy_rot = rotate(xy, -theta)
             xy_calib = xy_rot.copy()
             xy_calib[:,1] *= a / b
-            # 3. 分组heading
-            n1 = len(mxh1)
-            n2 = len(mxh2)
-            cal1 = xy_calib[:n1]
-            cal2 = xy_calib[n1:]
-            heading1 = np.array([calculate_heading(x, y) for x, y in cal1])
-            heading2 = np.array([calculate_heading(x, y) for x, y in cal2])
-            mean1 = np.mean(heading1)
-            mean2 = np.mean(heading2)
-            heading_drift = abs(mean1 - mean2)
-            # 4. 输出结果
-            result = f"水平均值: {mean1:.2f}°\n30度均值: {mean2:.2f}°\nheading_drift: {heading_drift:.2f}°\n"
-            if heading_drift < 3:
-                result += "\n结论：适合二维校准量产！（椭圆软铁补偿+坐标系修正）"
+            center = np.mean(xy_calib, axis=0)
+
+            debug_info += f"\n=== 椭圆拟合结果 ===\n"
+            debug_info += f"椭圆参数: a={a:.2f}, b={b:.2f}, theta={np.degrees(theta):.2f}°\n"
+            debug_info += f"软铁比例: a/b={a/b:.3f}\n"
+            debug_info += f"硬铁偏移: center=({center[0]:.2f}, {center[1]:.2f})\n"
+            debug_info += f"硬铁偏移大小: {np.sqrt(center[0]**2 + center[1]**2):.2f}\n"
+
+            # heading方案对比
+            debug_info += f"\n=== 静止数据heading方案对比（前10组） ===\n"
+            for i in range(min(10, len(mxh1))):
+                mx, my = mxh1[i], myh1[i]
+                yaw = data1[i, 4] if data1.shape[1] > 4 else 0
+                h1, h2, h3, h4, h5 = heading_schemes(mx, my)
+                debug_info += f"yaw={yaw:.2f}, h1={h1:.2f}, h2={h2:.2f}, h3={h3:.2f}, h4={h4:.2f}, h5={h5:.2f}\n"
+
+            heading1 = np.array([calculate_heading(x, y) for x, y in xy_calib])
+            heading_std = np.std(heading1)
+
+            debug_info += f"\n=== Heading计算结果 ===\n"
+            debug_info += f"水平heading: 均值={np.mean(heading1):.2f}°, 标准差={heading_std:.2f}°\n"
+
+            # 评估结论
+            result = debug_info + f"\n=== 最终结论 ===\n"
+            result += f"水平均值: {np.mean(heading1):.2f}°\n"
+            result += f"椭圆参数: a={a:.2f}, b={b:.2f}, theta={np.degrees(theta):.2f}°\n"
+            result += f"硬铁偏移: center=({center[0]:.2f}, {center[1]:.2f})\n"
+            result += f"硬铁偏移大小: {np.sqrt(center[0]**2 + center[1]**2):.2f}\n"
+
+            if heading_std < 2:
+                result += "\n结论：环境干净，无需硬铁矫正！"
+            elif heading_std < 5:
+                result += f"\n结论：环境有轻微干扰({heading_std:.1f}°)，建议做硬铁矫正。"
             else:
-                result += "\n结论：建议升级三轴椭球拟合或优化安装！（椭圆软铁补偿+坐标系修正）"
+                result += f"\n结论：环境有强干扰({heading_std:.1f}°)，必须做硬铁矫正！"
+
             self.result_text.setText(result)
         except Exception as e:
             self.result_text.setText(f"测试异常: {e}")

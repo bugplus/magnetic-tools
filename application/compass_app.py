@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QApplication
 from compass_ui import CompassMainWindow
 
 import matplotlib.pyplot as plt
+from config import MAG_AXIS_MAP
 
 CALIBRATION_DURATION = 30  # seconds
 
@@ -110,24 +111,32 @@ class CalibrationApp:
         self.raw_mag_data = []  # [mx, my, mz, roll, pitch, yaw]
         self.calibrated = False
         self.calibration_params = None
-        self.fig = None
-        self.ax_raw = None
-        self.ax_shifted = None
-        self.ax_calibrated = None
-        self.raw_plot = None
+        self.fig1 = None
+        self.fig2 = None
+        self.ax_original = None
+        self.ax_projected = None
+        self.ax_soft_iron = None
+        self.ax_final = None
+        self.original_plot = None
+        self.projected_plot = None
         self._pending_mag = None  # 用于暂存mag行
 
     def start_calibration(self, port, baudrate):
         try:
-            if self.fig is not None:
-                plt.close(self.fig)
+            if self.fig1 is not None:
+                plt.close(self.fig1)
+            if self.fig2 is not None:
+                plt.close(self.fig2)
         except Exception:
             pass
-        self.fig = None
-        self.ax_raw = None
-        self.ax_shifted = None
-        self.ax_calibrated = None
-        self.raw_plot = None
+        self.fig1 = None
+        self.fig2 = None
+        self.ax_original = None
+        self.ax_projected = None
+        self.ax_soft_iron = None
+        self.ax_final = None
+        self.original_plot = None
+        self.projected_plot = None
 
         self.raw_mag_data.clear()
         self.calibrated = False
@@ -137,16 +146,29 @@ class CalibrationApp:
         self.serial_thread = SerialReader(port, baudrate, self.on_serial_data)
         self.serial_thread.start()
         self.calibration_start_time = time.time()
-        self.fig, (self.ax_raw, self.ax_shifted, self.ax_calibrated) = plt.subplots(1, 3, figsize=(15, 4))
-        self.ax_raw.set_title("Raw Data")
-        self.ax_shifted.set_title("Soft Iron Calibrated")
-        self.ax_calibrated.set_title("Final Calibrated")
-        self.ax_raw.axis('equal')
-        self.ax_shifted.axis('equal')
-        self.ax_calibrated.axis('equal')
-        self.raw_plot, = self.ax_raw.plot([], [], 'b.', alpha=0.7)
+        # 创建两个画布：第一个显示原始数据和投影数据，第二个显示校准过程
+        self.fig1, (self.ax_original, self.ax_projected) = plt.subplots(1, 2, figsize=(12, 5))
+        self.fig2, (self.ax_soft_iron, self.ax_final) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 第一个画布：原始数据和倾斜补偿数据
+        self.ax_original.set_title("Original Data (mx, my)")
+        self.ax_projected.set_title("Tilt Compensated Data")
+        self.ax_original.axis('equal')
+        self.ax_projected.axis('equal')
+        
+        # 第二个画布：校准过程
+        self.ax_soft_iron.set_title("Soft Iron Calibrated")
+        self.ax_final.set_title("Final Calibrated (Soft + Hard Iron)")
+        self.ax_soft_iron.axis('equal')
+        self.ax_final.axis('equal')
+        
+        # 实时绘图对象
+        self.original_plot, = self.ax_original.plot([], [], 'r.', alpha=0.7)
+        self.projected_plot, = self.ax_projected.plot([], [], 'b.', alpha=0.7)
+        
         plt.tight_layout()
-        plt.show(block=False)
+        self.fig1.show()
+        self.fig2.show()
         threading.Thread(target=self._calibration_timer, daemon=True).start()
 
     def _calibration_timer(self):
@@ -159,31 +181,81 @@ class CalibrationApp:
     def extract_mag(self, mag_line):
         return [float(x) for x in re.findall(r'-?\d+\.?\d*', mag_line)]
 
+    def map_mag_to_imu(self, mx, my, mz):
+        mag = np.stack([mx, my, mz], axis=-1)
+        mag_imu = mag @ np.array(MAG_AXIS_MAP).T
+        return mag_imu[..., 0], mag_imu[..., 1], mag_imu[..., 2]
+
     def on_serial_data(self, line):
-        # 参考simple_calibration_tester.py的逻辑
+        # 适配你的数据格式：先mag后pitch
         if not line.strip():
             return
         if line.startswith('mag_x='):
             vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
             if vals:
                 mx, my, mz = map(float, vals[0])
-                mx, my = -mx, -my  # 坐标系修正
                 self._pending_mag = (mx, my, mz)
-        elif line.startswith('roll='):
-            vals = re.findall(r'roll=\s*([\-\d\.]+),\s*pitch=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
+        elif line.startswith('pitch='):
+            vals = re.findall(r'pitch=\s*([\-\d\.]+),\s*roll=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
             if vals and self._pending_mag is not None:
-                roll, pitch, yaw = map(float, vals[0])
+                pitch, roll, yaw = map(float, vals[0])
                 mx, my, mz = self._pending_mag
+                # 坐标系映射
+                mx, my, mz = self.map_mag_to_imu(np.array([mx]), np.array([my]), np.array([mz]))
+                mx, my, mz = mx[0], my[0], mz[0]
                 self.raw_mag_data.append([mx, my, mz, roll, pitch, yaw])
                 self._pending_mag = None
                 arr = np.array(self.raw_mag_data)
-                if arr.shape[0] > 0 and self.raw_plot is not None and self.ax_raw is not None:
-                    self.raw_plot.set_data(arr[:, 0], arr[:, 1])
-                    self.ax_raw.relim()
-                    self.ax_raw.autoscale_view()
-                    if self.fig is not None:
-                        self.fig.canvas.draw_idle()
-                        self.fig.canvas.flush_events()
+                if arr.shape[0] > 0 and self.original_plot is not None and self.projected_plot is not None:
+                    # 显示原始数据（红色）
+                    mx, my, mz, roll, pitch, yaw = arr.T
+                    self.original_plot.set_data(mx, my)
+                    
+                    # 计算并显示倾斜补偿后的数据（蓝色）
+                    roll_rad = np.radians(roll)
+                    pitch_rad = np.radians(pitch)
+                    mxh, myh = [], []
+                    for i in range(len(mx)):
+                        # 使用正确的倾斜补偿公式
+                        cos_p = np.cos(pitch_rad[i])
+                        sin_p = np.sin(pitch_rad[i])
+                        cos_r = np.cos(roll_rad[i])
+                        sin_r = np.sin(roll_rad[i])
+                        
+                        # 正确的水平投影公式
+                        mx_comp = mx[i] * cos_p + mz[i] * sin_p
+                        my_comp = my[i] * cos_r - mx[i] * sin_p * sin_r - mz[i] * cos_p * sin_r
+                        
+                        mxh.append(mx_comp)
+                        myh.append(my_comp)
+                    xy = np.stack([mxh, myh], axis=1)
+                    self.projected_plot.set_data(xy[:, 0], xy[:, 1])
+                    
+                    # 显示统计信息
+                    print(f"Total points: {len(arr)}")
+                    print(f"Roll range: {roll.min():.1f}° to {roll.max():.1f}°")
+                    print(f"Pitch range: {pitch.min():.1f}° to {pitch.max():.1f}°")
+                    
+                    # 调试信息：显示一些数据点的对比
+                    if len(mx) > 10:
+                        print(f"Sample data point 0:")
+                        print(f"  Raw: mx={mx[0]:.1f}, my={my[0]:.1f}, mz={mz[0]:.1f}")
+                        print(f"  Euler: roll={roll[0]:.1f}°, pitch={pitch[0]:.1f}°, yaw={yaw[0]:.1f}°")
+                    
+                    # 更新坐标轴 - 确保能看到形状差异
+                    if self.ax_original is not None:
+                        self.ax_original.relim()
+                        self.ax_original.autoscale_view()
+                        self.ax_original.set_aspect('equal', adjustable='box')
+                    if self.ax_projected is not None:
+                        self.ax_projected.relim()
+                        self.ax_projected.autoscale_view()
+                        self.ax_projected.set_aspect('equal', adjustable='box')
+                    
+                    # 刷新画布
+                    if self.fig1 is not None:
+                        self.fig1.canvas.draw_idle()
+                        self.fig1.canvas.flush_events()
 
     def perform_calibration(self):
         self.window.set_status("Calibration finished. Processing data...")
@@ -196,18 +268,32 @@ class CalibrationApp:
             return
         arr = np.array(self.raw_mag_data)
         mx, my, mz, roll, pitch, yaw = arr.T
+        
+        # 调试信息：显示欧拉角的统计
+        print(f"Roll range: {roll.min():.2f} to {roll.max():.2f} degrees")
+        print(f"Pitch range: {pitch.min():.2f} to {pitch.max():.2f} degrees")
+        print(f"Yaw range: {yaw.min():.2f} to {yaw.max():.2f} degrees")
+        
         # 倾角补偿（pitch/roll转弧度）
-        roll = np.radians(roll)
-        pitch = np.radians(pitch)
+        roll_rad = np.radians(roll)
+        pitch_rad = np.radians(pitch)
         mxh, myh = [], []
         for i in range(len(mx)):
-            # 标准倾角补偿公式
-            mx_comp = mx[i] * np.cos(pitch[i]) + mz[i] * np.sin(pitch[i])
-            my_comp = mx[i] * np.sin(roll[i]) * np.sin(pitch[i]) + my[i] * np.cos(roll[i]) - mz[i] * np.sin(roll[i]) * np.cos(pitch[i])
+            # 使用正确的倾斜补偿公式
+            cos_p = np.cos(pitch_rad[i])
+            sin_p = np.sin(pitch_rad[i])
+            cos_r = np.cos(roll_rad[i])
+            sin_r = np.sin(roll_rad[i])
+            
+            # 正确的水平投影公式
+            # 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
+            mx_comp = mx[i] * cos_p + mz[i] * sin_p
+            my_comp = my[i] * cos_r - mx[i] * sin_p * sin_r - mz[i] * cos_p * sin_r
+            
             mxh.append(mx_comp)
             myh.append(my_comp)
         xy = np.stack([mxh, myh], axis=1)
-        # 椭圆拟合（软/硬铁补偿）
+        # 用xy做椭圆拟合
         raw_center, _ = fit_circle_least_squares(xy)
         a, b = raw_center
         radius_x = (np.max(xy[:, 0] - a))
@@ -224,37 +310,45 @@ class CalibrationApp:
         mask = np.abs(dist - median_dist) < 3 * std_dist
         filtered_final_calibrated = final_calibrated[mask]
         filtered_xy = xy[mask]
-        # Plotting
-        if self.ax_shifted is not None:
-            self.ax_shifted.cla()
-            self.ax_shifted.set_title("Soft Iron Calibrated (center unchanged)")
-            self.ax_shifted.axis('equal')
-            self.ax_shifted.plot(soft_calibrated[:, 0], soft_calibrated[:, 1], 'r.', alpha=0.7)
-            self.ax_shifted.plot(a, b, 'rx', markersize=10, mew=2)
-            self.ax_shifted.plot(0, 0, 'k+', markersize=10, mew=2)
-        if self.ax_calibrated is not None:
-            self.ax_calibrated.cla()
-            self.ax_calibrated.set_title(f"Final Calibrated\nScale: {scale:.4f}")
-            self.ax_calibrated.axis('equal')
-            self.ax_calibrated.plot(filtered_final_calibrated[:, 0], filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
-            self.ax_calibrated.plot(0, 0, 'rx', markersize=10, mew=2)
-            self.ax_calibrated.plot(0, 0, 'k+', markersize=10, mew=2)
-        if self.ax_raw is not None:
-            self.ax_raw.plot(0, 0, 'k+', markersize=10, mew=2)
-            self.ax_raw.plot(a, b, 'rx', markersize=10, mew=2)
+        # Plotting - 更新第二个画布（校准过程）
+        if self.ax_soft_iron is not None:
+            self.ax_soft_iron.cla()
+            self.ax_soft_iron.set_title("Soft Iron Calibrated")
+            self.ax_soft_iron.axis('equal')
+            self.ax_soft_iron.plot(soft_calibrated[:, 0], soft_calibrated[:, 1], 'r.', alpha=0.7)
+            self.ax_soft_iron.plot(a, b, 'rx', markersize=10, mew=2)
+            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)
+        if self.ax_final is not None:
+            self.ax_final.cla()
+            self.ax_final.set_title(f"Final Calibrated (Soft + Hard Iron)\nScale: {scale:.4f}")
+            self.ax_final.axis('equal')
+            self.ax_final.plot(filtered_final_calibrated[:, 0], filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
+            self.ax_final.plot(0, 0, 'rx', markersize=10, mew=2)
+            self.ax_final.plot(0, 0, 'k+', markersize=10, mew=2)
         R = max(
             np.abs(filtered_xy[:, 0]).max(), np.abs(filtered_xy[:, 1]).max(),
             np.abs(soft_calibrated[:, 0]).max(), np.abs(soft_calibrated[:, 1]).max(),
             np.abs(filtered_final_calibrated[:, 0]).max(), np.abs(filtered_final_calibrated[:, 1]).max()
         )
-        for ax in [self.ax_raw, self.ax_shifted, self.ax_calibrated]:
+        # 设置第一个画布的坐标轴
+        for ax in [self.ax_original, self.ax_projected]:
             if ax is not None:
                 ax.set_xlim(-R, R)
                 ax.set_ylim(-R, R)
                 ax.set_aspect('equal', adjustable='box')
-        if self.fig is not None:
-            self.fig.canvas.draw_idle()
-            self.fig.canvas.flush_events()
+        # 设置第二个画布的坐标轴
+        for ax in [self.ax_soft_iron, self.ax_final]:
+            if ax is not None:
+                ax.set_xlim(-R, R)
+                ax.set_ylim(-R, R)
+                ax.set_aspect('equal', adjustable='box')
+        # 刷新两个画布
+        if self.fig1 is not None:
+            self.fig1.canvas.draw_idle()
+            self.fig1.canvas.flush_events()
+        if self.fig2 is not None:
+            self.fig2.canvas.draw_idle()
+            self.fig2.canvas.flush_events()
         self.window.set_status("Calibration finished. Click View Result to see results.")
         self.window.enable_view_btn(True)
         self.calibration_params = (center_after_soft, scale, filtered_xy, filtered_final_calibrated)

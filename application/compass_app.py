@@ -120,6 +120,7 @@ class CalibrationApp:
         self.original_plot = None
         self.projected_plot = None
         self._pending_mag = None  # 用于暂存mag行
+        self._pending_euler = None # 用于暂存欧拉角
 
     def start_calibration(self, port, baudrate):
         try:
@@ -141,6 +142,7 @@ class CalibrationApp:
         self.raw_mag_data.clear()
         self.calibrated = False
         self.calibration_params = None
+        self._pending_euler = None  # 清空待处理的欧拉角数据
         self.window.clear_all_canvases()
         self.window.set_status("Calibrating...")
         self.serial_thread = SerialReader(port, baudrate, self.on_serial_data)
@@ -187,24 +189,34 @@ class CalibrationApp:
         return mag_imu[..., 0], mag_imu[..., 1], mag_imu[..., 2]
 
     def on_serial_data(self, line):
-        # 适配你的数据格式：先mag后pitch
-        if not line.strip():
-            return
-        if line.startswith('mag_x='):
-            vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
-            if vals:
-                mx, my, mz = map(float, vals[0])
-                self._pending_mag = (mx, my, mz)
-        elif line.startswith('pitch='):
-            vals = re.findall(r'pitch=\s*([\-\d\.]+),\s*roll=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
-            if vals and self._pending_mag is not None:
-                pitch, roll, yaw = map(float, vals[0])
-                mx, my, mz = self._pending_mag
-                # 坐标系映射
-                mx, my, mz = self.map_mag_to_imu(np.array([mx]), np.array([my]), np.array([mz]))
-                mx, my, mz = mx[0], my[0], mz[0]
-                self.raw_mag_data.append([mx, my, mz, roll, pitch, yaw])
-                self._pending_mag = None
+        try:
+            # 适配你的数据格式：simples行、pitch行、mag_x行
+            if not line.strip():
+                return
+            if line.startswith('simples:'):
+                # 解析simples行：simples:62.463959,-1.012322,-90.374313,27.030861
+                vals = re.findall(r'simples:([\-\d\.]+),([\-\d\.]+),([\-\d\.]+),([\-\d\.]+)', line)
+                if vals:
+                    pitch, roll, yaw, testyaw = map(float, vals[0])
+                    self._pending_euler = (pitch, roll, yaw)
+            elif line.startswith('pitch='):
+                # 解析pitch行：pitch= 62.463959, roll= -1.012322,yaw= -90.374313, testyaw= 27.030861
+                vals = re.findall(r'pitch=\s*([\-\d\.]+),\s*roll=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
+                if vals:
+                    pitch, roll, yaw = map(float, vals[0])
+                    self._pending_euler = (pitch, roll, yaw)
+            elif line.startswith('mag_x='):
+                # 解析mag_x行：mag_x=247, mag_y=137, mag_z=-57
+                vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
+                if vals and self._pending_euler is not None:
+                    mx, my, mz = map(float, vals[0])
+                    pitch, roll, yaw = self._pending_euler
+                    # 坐标系映射
+                    mx, my, mz = self.map_mag_to_imu(np.array([mx]), np.array([my]), np.array([mz]))
+                    mx, my, mz = mx[0], my[0], mz[0]
+                    self.raw_mag_data.append([mx, my, mz, roll, pitch, yaw])
+                    self._pending_euler = None
+                    print(f"Data paired: mag=({mx:.1f}, {my:.1f}, {mz:.1f}), euler=({roll:.1f}, {pitch:.1f}, {yaw:.1f})")
                 arr = np.array(self.raw_mag_data)
                 if arr.shape[0] > 0 and self.original_plot is not None and self.projected_plot is not None:
                     # 显示原始数据（红色）
@@ -216,15 +228,16 @@ class CalibrationApp:
                     pitch_rad = np.radians(pitch)
                     mxh, myh = [], []
                     for i in range(len(mx)):
-                        # 使用正确的倾斜补偿公式
+                        # 使用标准的倾斜补偿公式
                         cos_p = np.cos(pitch_rad[i])
                         sin_p = np.sin(pitch_rad[i])
                         cos_r = np.cos(roll_rad[i])
                         sin_r = np.sin(roll_rad[i])
                         
-                        # 正确的水平投影公式
+                        # 标准倾斜补偿公式（使用旋转矩阵）
+                        # 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
                         mx_comp = mx[i] * cos_p + mz[i] * sin_p
-                        my_comp = my[i] * cos_r - mx[i] * sin_p * sin_r - mz[i] * cos_p * sin_r
+                        my_comp = mx[i] * sin_p * sin_r + my[i] * cos_r - mz[i] * cos_p * sin_r
                         
                         mxh.append(mx_comp)
                         myh.append(my_comp)
@@ -256,6 +269,9 @@ class CalibrationApp:
                     if self.fig1 is not None:
                         self.fig1.canvas.draw_idle()
                         self.fig1.canvas.flush_events()
+        except Exception as e:
+            print(f"Serial data parsing error: {e}")
+            print(f"Problematic line: {line.strip()}")
 
     def perform_calibration(self):
         self.window.set_status("Calibration finished. Processing data...")
@@ -279,16 +295,16 @@ class CalibrationApp:
         pitch_rad = np.radians(pitch)
         mxh, myh = [], []
         for i in range(len(mx)):
-            # 使用正确的倾斜补偿公式
+            # 使用标准的倾斜补偿公式
             cos_p = np.cos(pitch_rad[i])
             sin_p = np.sin(pitch_rad[i])
             cos_r = np.cos(roll_rad[i])
             sin_r = np.sin(roll_rad[i])
             
-            # 正确的水平投影公式
+            # 标准倾斜补偿公式（使用旋转矩阵）
             # 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
             mx_comp = mx[i] * cos_p + mz[i] * sin_p
-            my_comp = my[i] * cos_r - mx[i] * sin_p * sin_r - mz[i] * cos_p * sin_r
+            my_comp = mx[i] * sin_p * sin_r + my[i] * cos_r - mz[i] * cos_p * sin_r
             
             mxh.append(mx_comp)
             myh.append(my_comp)

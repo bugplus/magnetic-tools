@@ -355,8 +355,8 @@ class CalibrationApp:
         self.ax_projected.axis('equal')
         
         # 第二个画布：校准过程
-        self.ax_soft_iron.set_title("Soft Iron Calibrated")
-        self.ax_final.set_title("Final Calibrated (Soft + Hard Iron)")
+        self.ax_soft_iron.set_title("Hard Iron Calibrated")
+        self.ax_final.set_title("Final Calibrated (Hard + Soft Iron)")
         self.ax_soft_iron.axis('equal')
         self.ax_final.axis('equal')
         
@@ -482,16 +482,11 @@ class CalibrationApp:
             self.window.set_status("Not enough data for calibration.")
             self.window.start_btn.setEnabled(True)
             self.window.port_combo.setEnabled(True)
-            self.window.baud_combo.setEnabled(True)
+            self.window.baud_combo.setEnabled(False)
             self.window.refresh_btn.setEnabled(True)
             return
         arr = np.array(self.raw_mag_data)
         mx, my, mz, roll, pitch, yaw = arr.T
-        
-        # 调试信息：显示欧拉角的统计
-        print(f"Roll range: {roll.min():.2f} to {roll.max():.2f} degrees")
-        print(f"Pitch range: {pitch.min():.2f} to {pitch.max():.2f} degrees")
-        print(f"Yaw range: {yaw.min():.2f} to {yaw.max():.2f} degrees")
         
         # 倾角补偿（pitch/roll转弧度）
         roll_rad = np.radians(roll)
@@ -512,43 +507,64 @@ class CalibrationApp:
             mxh.append(mx_comp)
             myh.append(my_comp)
         xy = np.stack([mxh, myh], axis=1)
-        # 用xy做椭圆拟合
-        raw_center, _ = fit_circle_least_squares(xy)
-        a, b = raw_center
-        radius_x = (np.max(xy[:, 0] - a))
-        radius_y = (np.max(xy[:, 1] - b))
+        
+        # 计算倾斜补偿数据的圆心
+        center_tilt, radius_tilt = fit_circle_least_squares(xy)
+
+        # 在图2上绘制圆心和原点
+        if self.ax_projected is not None:
+            self.ax_projected.cla()
+            self.ax_projected.set_title("Tilt Compensated Data")
+            self.ax_projected.axis('equal')
+            self.ax_projected.plot(xy[:, 0], xy[:, 1], 'b.', alpha=0.7)
+            self.ax_projected.plot(center_tilt[0], center_tilt[1], 'ro', label='Center of Tilt Compensated Data')
+            self.ax_projected.plot(0, 0, 'g+', markersize=10, label='Origin')
+            self.ax_projected.legend()
+
+        # 修改：先硬铁校准（去中心），再软铁校准（缩放）
+        # 1. 硬铁校准：先减去偏移
+        center_after_hard, _ = fit_circle_least_squares(xy)
+        hard_calibrated = xy - center_after_hard
+        
+        # 2. 软铁校准：后做缩放
+        radius_x = (np.max(hard_calibrated[:, 0]) - np.min(hard_calibrated[:, 0])) / 2
+        radius_y = (np.max(hard_calibrated[:, 1]) - np.min(hard_calibrated[:, 1])) / 2
         scale = radius_x / radius_y if radius_y != 0 else 1.0
-        soft_calibrated = xy.copy()
-        soft_calibrated[:, 0] = a + (soft_calibrated[:, 0] - a)
-        soft_calibrated[:, 1] = b + (soft_calibrated[:, 1] - b) * scale
-        center_after_soft, _ = fit_circle_least_squares(soft_calibrated)
-        final_calibrated = soft_calibrated - center_after_soft
+        soft_calibrated = hard_calibrated.copy()
+        soft_calibrated[:, 1] *= scale
+        
+        # 最终校准结果
+        final_calibrated = soft_calibrated
+
         dist = np.linalg.norm(final_calibrated, axis=1)
         median_dist = np.median(dist)
         std_dist = np.std(dist)
         mask = np.abs(dist - median_dist) < 3 * std_dist
         filtered_final_calibrated = final_calibrated[mask]
         filtered_xy = xy[mask]
-        # Plotting - 更新第二个画布（校准过程）
+        
+        # 修改：更新图表显示顺序 - 第三张图改为硬铁校准图
         if self.ax_soft_iron is not None:
             self.ax_soft_iron.cla()
-            self.ax_soft_iron.set_title("Soft Iron Calibrated")
+            self.ax_soft_iron.set_title("Hard Iron Calibrated")  # 修改为硬铁校准
             self.ax_soft_iron.axis('equal')
-            self.ax_soft_iron.plot(soft_calibrated[:, 0], soft_calibrated[:, 1], 'r.', alpha=0.7)
-            self.ax_soft_iron.plot(a, b, 'rx', markersize=10, mew=2)
-            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)
+            self.ax_soft_iron.plot(hard_calibrated[:, 0], hard_calibrated[:, 1], 'r.', alpha=0.7)
+            self.ax_soft_iron.plot(0, 0, 'rx', markersize=10, mew=2)  # 中心点
+            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)  # 原点
         if self.ax_final is not None:
             self.ax_final.cla()
-            self.ax_final.set_title(f"Final Calibrated (Soft + Hard Iron)\nScale: {scale:.4f}")
+            self.ax_final.set_title(f"Final Calibrated (Hard + Soft Iron)\nScale: {scale:.4f}")
             self.ax_final.axis('equal')
             self.ax_final.plot(filtered_final_calibrated[:, 0], filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
             self.ax_final.plot(0, 0, 'rx', markersize=10, mew=2)
             self.ax_final.plot(0, 0, 'k+', markersize=10, mew=2)
+            
         R = max(
             np.abs(filtered_xy[:, 0]).max(), np.abs(filtered_xy[:, 1]).max(),
-            np.abs(soft_calibrated[:, 0]).max(), np.abs(soft_calibrated[:, 1]).max(),
+            np.abs(hard_calibrated[:, 0]).max(), np.abs(hard_calibrated[:, 1]).max(),
             np.abs(filtered_final_calibrated[:, 0]).max(), np.abs(filtered_final_calibrated[:, 1]).max()
         )
+        
         # 设置第一个画布的坐标轴
         for ax in [self.ax_original, self.ax_projected]:
             if ax is not None:
@@ -561,6 +577,7 @@ class CalibrationApp:
                 ax.set_xlim(-R, R)
                 ax.set_ylim(-R, R)
                 ax.set_aspect('equal', adjustable='box')
+                
         # 刷新两个画布
         if self.fig1 is not None:
             self.fig1.canvas.draw_idle()
@@ -569,17 +586,18 @@ class CalibrationApp:
             self.fig2.canvas.draw_idle()
             self.fig2.canvas.flush_events()
             self.fig2.canvas.manager.window.move(50, 600)
+            
         self.window.set_status("Calibration finished. Click View Result to see results.")
         self.window.enable_view_btn(True)
-        # 保存校准参数，包括原始椭圆数据
-        self.calibration_params = (center_after_soft, scale, 
-                                 np.column_stack([mx, my]),  # 原始椭圆数据
-                                 filtered_final_calibrated)  # 最终校准数据
+        
+        # 保存校准参数，注意现在center_after_hard是硬铁校准参数
+        self.calibration_params = (center_after_hard, scale, 
+                                np.column_stack([mx, my]),  # 原始椭圆数据
+                                filtered_final_calibrated)  # 最终校准数据
         self.window.start_btn.setEnabled(True)
         self.window.port_combo.setEnabled(True)
         self.window.baud_combo.setEnabled(True)
         self.window.refresh_btn.setEnabled(True)
-
     def view_result(self):
         if not self.calibration_params:
             self.window.set_status("Please finish calibration first.")

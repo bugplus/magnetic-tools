@@ -365,7 +365,9 @@ class CalibrationApp:
         
         plt.tight_layout()
         self.fig1.show()
+        self.fig1.canvas.manager.window.move(50, 50)
         self.fig2.show()
+        self.fig2.canvas.manager.window.move(50, 600)
         threading.Thread(target=self._calibration_timer, daemon=True).start()
 
     def _calibration_timer(self):
@@ -465,6 +467,7 @@ class CalibrationApp:
                     if self.fig1 is not None:
                         self.fig1.canvas.draw_idle()
                         self.fig1.canvas.flush_events()
+                        self.fig1.canvas.manager.window.move(50, 50)
         except Exception as e:
             print(f"Serial data parsing error: {e}")
             print(f"Problematic line: {line.strip()}")
@@ -561,6 +564,7 @@ class CalibrationApp:
         if self.fig2 is not None:
             self.fig2.canvas.draw_idle()
             self.fig2.canvas.flush_events()
+            self.fig2.canvas.manager.window.move(50, 600)
         self.window.set_status("Calibration finished. Click View Result to see results.")
         self.window.enable_view_btn(True)
         # 保存校准参数，包括原始椭圆数据

@@ -316,6 +316,7 @@ class CalibrationApp:
         self.projected_plot = None
         self._pending_mag = None  # 用于暂存mag行
         self._pending_euler = None # 用于暂存欧拉角
+        self.last_xy = None     # 缓存上一次画过的点
 
     def start_calibration(self, port, baudrate):
         try:
@@ -440,6 +441,10 @@ class CalibrationApp:
                         mxh.append(mx_comp)
                         myh.append(my_comp)
                     xy = np.stack([mxh, myh], axis=1)
+                    if self.last_xy is None or not np.array_equal(self.last_xy, xy):
+                        self.last_xy = xy
+                        self.original_plot.set_data(xy[:, 0], xy[:, 1])
+                        self.projected_plot.set_data(xy[:, 0], xy[:, 1])
                     self.projected_plot.set_data(xy[:, 0], xy[:, 1])
                     
                     # 显示统计信息

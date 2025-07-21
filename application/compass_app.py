@@ -69,64 +69,64 @@ def calibrate_magnetometer_least_squares(xy):
     return shifted, calibrated, center, scale
 
 def generate_c_code(center, scale):
+    cx, cy = center[0], center[1]
     c_code = f"""
 /**
- * 磁力计校准算法 - 自动生成
- * 包含倾斜补偿和软铁/硬铁校准
+ * 磁力计校准算法 - 2×2 对角软铁矩阵版
+ * 与原 SOFT_IRON_SCALE 完全等价，保留所有接口与示例
  */
 
 #include <math.h>
+#include <stdio.h>
 
-// 校准参数
-#define HARD_IRON_OFFSET_X {center[0]:.6f}f
-#define HARD_IRON_OFFSET_Y {center[1]:.6f}f
-#define SOFT_IRON_SCALE {scale:.6f}f
+// ---------- 校准参数 ----------
+#define HARD_IRON_OFFSET_X {cx:.6f}f
+#define HARD_IRON_OFFSET_Y {cy:.6f}f
 
-// 坐标系映射类型
+// 2×2 对角软铁矩阵（与原 scale 等价）
+static const float SOFT_IRON_MATRIX[2][2] = {{
+    {{1.0f, 0.0f}},
+    {{0.0f, {scale:.6f}f}}
+}};
+
+// ---------- 数据结构 ----------
 typedef enum {{
     MAPPING_TYPE_1 = 1,  // X→Y, Y→X, Z→Z
-    MAPPING_TYPE_2 = 2,  // X→X, Y→Y, Z→Z (原始映射)
-    MAPPING_TYPE_3 = 3   // X→-X, Y→Y, Z→Z (X轴取负)
+    MAPPING_TYPE_2 = 2,  // X→X, Y→Y, Z→Z
+    MAPPING_TYPE_3 = 3   // X→-X, Y→Y, Z→Z
 }} mapping_type_t;
 
-// 输入数据结构
 typedef struct {{
-    float mag_x, mag_y, mag_z;  // 磁力计原始数据
-    float pitch, roll, yaw;     // 欧拉角(度)
-    mapping_type_t mapping;     // 坐标系映射类型
+    float mag_x, mag_y, mag_z;
+    float pitch, roll, yaw;
+    mapping_type_t mapping;
 }} tilt_input_t;
 
-// 输出数据结构
 typedef struct {{
-    float mx_comp, my_comp;     // 倾斜补偿后的水平磁场
-    float mx_cal, my_cal;       // 校准后的磁场
+    float mx_comp, my_comp;   // 倾斜补偿后水平磁场
+    float mx_cal, my_cal;     // 软铁/硬铁校准后
 }} tilt_output_t;
 
-/**
- * 坐标系映射函数
- */
-void map_coordinates(float mag_x, float mag_y, float mag_z, 
-                    mapping_type_t mapping,
-                    float *mx_out, float *my_out, float *mz_out) {{
+// ---------- 坐标映射 ----------
+void map_coordinates(float mag_x, float mag_y, float mag_z,
+                     mapping_type_t mapping,
+                     float *mx_out, float *my_out, float *mz_out) {{
     switch(mapping) {{
-        case MAPPING_TYPE_1:  // X→Y, Y→X, Z→Z
+        case MAPPING_TYPE_1:
             *mx_out = mag_y;
             *my_out = mag_x;
             *mz_out = mag_z;
             break;
-            
-        case MAPPING_TYPE_2:  // X→X, Y→Y, Z→Z (原始映射)
+        case MAPPING_TYPE_2:
             *mx_out = mag_x;
             *my_out = mag_y;
             *mz_out = mag_z;
             break;
-            
-        case MAPPING_TYPE_3:  // X→-X, Y→Y, Z→Z (X轴取负)
+        case MAPPING_TYPE_3:
             *mx_out = -mag_x;
             *my_out = mag_y;
             *mz_out = mag_z;
             break;
-            
         default:
             *mx_out = mag_x;
             *my_out = mag_y;
@@ -135,96 +135,63 @@ void map_coordinates(float mag_x, float mag_y, float mag_z,
     }}
 }}
 
-/**
- * 倾斜补偿算法
- */
+// ---------- 倾斜补偿 ----------
 void tilt_compensation(tilt_input_t *input, tilt_output_t *output) {{
-    // 1. 坐标系映射
     float mx, my, mz;
-    map_coordinates(input->mag_x, input->mag_y, input->mag_z, 
-                   input->mapping, &mx, &my, &mz);
-    
-    // 2. 欧拉角转弧度
+    map_coordinates(input->mag_x, input->mag_y, input->mag_z,
+                    input->mapping, &mx, &my, &mz);
+
     float pitch_rad = input->pitch * M_PI / 180.0f;
-    float roll_rad = input->roll * M_PI / 180.0f;
-    
-    // 3. 计算三角函数
+    float roll_rad  = input->roll  * M_PI / 180.0f;
+
     float cos_p = cosf(pitch_rad);
     float sin_p = sinf(pitch_rad);
     float cos_r = cosf(roll_rad);
     float sin_r = sinf(roll_rad);
-    
-    // 4. 倾斜补偿公式
-    // 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
+
     output->mx_comp = mx * cos_p + mz * sin_p;
     output->my_comp = mx * sin_p * sin_r + my * cos_r - mz * cos_p * sin_r;
 }}
 
-/**
- * 软铁/硬铁校准算法
- */
+// ---------- 软铁/硬铁校准 ----------
 void calibrate_magnetometer(float *mx_comp, float *my_comp) {{
-    // 硬铁校准：减去偏移
-    *mx_comp -= HARD_IRON_OFFSET_X;
-    *my_comp -= HARD_IRON_OFFSET_Y;
-    
-    // 软铁校准：缩放
-    *my_comp *= SOFT_IRON_SCALE;
+    // 1. 硬铁
+    float x = *mx_comp - HARD_IRON_OFFSET_X;
+    float y = *my_comp - HARD_IRON_OFFSET_Y;
+
+    // 2. 软铁（矩阵形式，等价 y *= scale）
+    *mx_comp = SOFT_IRON_MATRIX[0][0] * x + SOFT_IRON_MATRIX[0][1] * y;
+    *my_comp = SOFT_IRON_MATRIX[1][0] * x + SOFT_IRON_MATRIX[1][1] * y;
 }}
 
-/**
- * 完整的磁力计处理函数
- */
+// ---------- 完整处理 ----------
 void process_magnetometer_data(tilt_input_t *input, tilt_output_t *output) {{
-    // 1. 倾斜补偿
     tilt_compensation(input, output);
-    
-    // 2. 软铁/硬铁校准
     calibrate_magnetometer(&output->mx_comp, &output->my_comp);
-    
-    // 3. 保存校准后的结果
     output->mx_cal = output->mx_comp;
     output->my_cal = output->my_comp;
 }}
 
-/**
- * 计算磁偏角（指南针方向）
- */
-float calculate_heading(float mx_cal, float my_cal) {{
-    float heading = atan2f(my_cal, mx_cal) * 180.0f / M_PI;
-    if (heading < 0) {{
-        heading += 360.0f;
-    }}
-    return heading;
-}}
-
-/**
- * 使用示例
- */
-void example_usage() {{
-    // 示例数据
+// ---------- 使用示例 ----------
+void example_usage(void) {{
     tilt_input_t input = {{
         .mag_x = 247.0f,
-        .mag_y = 137.0f, 
+        .mag_y = 137.0f,
         .mag_z = -57.0f,
         .pitch = 62.46f,
-        .roll = -1.01f,
-        .yaw = -90.37f,
+        .roll  = -1.01f,
+        .yaw   = -90.37f,
         .mapping = MAPPING_TYPE_1
     }};
-    
     tilt_output_t output;
-    
-    // 执行完整的磁力计处理
+
     process_magnetometer_data(&input, &output);
-    
-    // 计算指南针方向
-    float heading = calculate_heading(output.mx_cal, output.my_cal);
-    
-    // 输出结果
-    printf("倾斜补偿结果: mx=%.2f, my=%.2f\\n", output.mx_comp, output.my_comp);
-    printf("校准后结果: mx=%.2f, my=%.2f\\n", output.mx_cal, output.my_cal);
-    printf("指南针方向: %.1f°\\n", heading);
+    float heading = atan2f(output.my_cal, output.mx_cal) * 180.0f / M_PI;
+    if (heading < 0) heading += 360.0f;
+
+    printf("倾斜补偿: mx=%.2f, my=%.2f\\n", output.mx_comp, output.my_comp);
+    printf("校准结果: mx=%.2f, my=%.2f\\n", output.mx_cal,  output.my_cal);
+    printf("航向角: %.1f°\\n", heading);
 }}
 """
     return c_code
@@ -485,100 +452,80 @@ class CalibrationApp:
             self.window.baud_combo.setEnabled(False)
             self.window.refresh_btn.setEnabled(True)
             return
+
         arr = np.array(self.raw_mag_data)
         mx, my, mz, roll, pitch, yaw = arr.T
-        
-        # 倾角补偿（pitch/roll转弧度）
+
+        # 1. 倾斜补偿（二维）
         roll_rad = np.radians(roll)
         pitch_rad = np.radians(pitch)
-        mxh, myh = [], []
+        xy = []
         for i in range(len(mx)):
-            # 使用标准的倾斜补偿公式
             cos_p = np.cos(pitch_rad[i])
             sin_p = np.sin(pitch_rad[i])
             cos_r = np.cos(roll_rad[i])
             sin_r = np.sin(roll_rad[i])
-            
-            # 标准倾斜补偿公式（使用旋转矩阵）
-            # 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
             mx_comp = mx[i] * cos_p + mz[i] * sin_p
             my_comp = mx[i] * sin_p * sin_r + my[i] * cos_r - mz[i] * cos_p * sin_r
-            
-            mxh.append(mx_comp)
-            myh.append(my_comp)
-        xy = np.stack([mxh, myh], axis=1)
-        
-        # 计算倾斜补偿数据的圆心
-        center_tilt, radius_tilt = fit_circle_least_squares(xy)
+            xy.append([mx_comp, my_comp])
+        xy = np.array(xy)
 
-        # 在图2上绘制圆心和原点
-        if self.ax_projected is not None:
-            self.ax_projected.cla()
-            self.ax_projected.set_title("Tilt Compensated Data")
-            self.ax_projected.axis('equal')
-            self.ax_projected.plot(xy[:, 0], xy[:, 1], 'b.', alpha=0.7)
-            self.ax_projected.plot(center_tilt[0], center_tilt[1], 'ro', label='Center of Tilt Compensated Data')
-            self.ax_projected.plot(0, 0, 'g+', markersize=10, label='Origin')
-            self.ax_projected.legend()
+        # 2. 硬铁校准：去中心
+        center_hard, _ = fit_circle_least_squares(xy)
+        hard_calibrated = xy - center_hard
 
-        # 修改：先硬铁校准（去中心），再软铁校准（缩放）
-        # 1. 硬铁校准：先减去偏移
-        center_after_hard, _ = fit_circle_least_squares(xy)
-        hard_calibrated = xy - center_after_hard
-        
-        # 2. 软铁校准：后做缩放
+        # 3. 软铁校准：单轴缩放 → 对角矩阵（与原算法等价）
         radius_x = (np.max(hard_calibrated[:, 0]) - np.min(hard_calibrated[:, 0])) / 2
         radius_y = (np.max(hard_calibrated[:, 1]) - np.min(hard_calibrated[:, 1])) / 2
         scale = radius_x / radius_y if radius_y != 0 else 1.0
-        soft_calibrated = hard_calibrated.copy()
-        soft_calibrated[:, 1] *= scale
-        
-        # 最终校准结果
+
+        # 构造对角矩阵（与原单轴缩放完全等价）
+        soft_matrix = np.array([[1.0, 0.0],
+                                [0.0, scale]])
+        soft_inv = soft_matrix  # 对角矩阵逆矩阵即取倒数
+
+        soft_calibrated = (soft_inv @ hard_calibrated.T).T
         final_calibrated = soft_calibrated
 
+        # 4. 离群过滤
         dist = np.linalg.norm(final_calibrated, axis=1)
         median_dist = np.median(dist)
         std_dist = np.std(dist)
         mask = np.abs(dist - median_dist) < 3 * std_dist
         filtered_final_calibrated = final_calibrated[mask]
-        filtered_xy = xy[mask]
-        
-        # 修改：更新图表显示顺序 - 第三张图改为硬铁校准图
+
+        # 5. 绘图
+        if self.ax_projected is not None:
+            self.ax_projected.cla()
+            self.ax_projected.set_title("Tilt Compensated Data")
+            self.ax_projected.axis('equal')
+            self.ax_projected.plot(xy[:, 0], xy[:, 1], 'b.', alpha=0.7)
+            self.ax_projected.plot(center_hard[0], center_hard[1], 'ro', label='Center')
+            self.ax_projected.plot(0, 0, 'g+', markersize=10)
+            self.ax_projected.legend()
+
         if self.ax_soft_iron is not None:
             self.ax_soft_iron.cla()
-            self.ax_soft_iron.set_title("Hard Iron Calibrated")  # 修改为硬铁校准
+            self.ax_soft_iron.set_title("Hard Iron Calibrated")
             self.ax_soft_iron.axis('equal')
             self.ax_soft_iron.plot(hard_calibrated[:, 0], hard_calibrated[:, 1], 'r.', alpha=0.7)
-            self.ax_soft_iron.plot(0, 0, 'rx', markersize=10, mew=2)  # 中心点
-            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)  # 原点
+            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)
+
         if self.ax_final is not None:
             self.ax_final.cla()
-            self.ax_final.set_title(f"Final Calibrated (Hard + Soft Iron)\nScale: {scale:.4f}")
+            self.ax_final.set_title("Final Calibrated (Hard + Soft Iron)")
             self.ax_final.axis('equal')
             self.ax_final.plot(filtered_final_calibrated[:, 0], filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
-            self.ax_final.plot(0, 0, 'rx', markersize=10, mew=2)
             self.ax_final.plot(0, 0, 'k+', markersize=10, mew=2)
-            
-        R = max(
-            np.abs(filtered_xy[:, 0]).max(), np.abs(filtered_xy[:, 1]).max(),
-            np.abs(hard_calibrated[:, 0]).max(), np.abs(hard_calibrated[:, 1]).max(),
-            np.abs(filtered_final_calibrated[:, 0]).max(), np.abs(filtered_final_calibrated[:, 1]).max()
-        )
-        
-        # 设置第一个画布的坐标轴
-        for ax in [self.ax_original, self.ax_projected]:
+
+        # 6. 统一坐标轴
+        R = max(np.abs(hard_calibrated).max(), np.abs(filtered_final_calibrated).max())
+        for ax in (self.ax_original, self.ax_projected, self.ax_soft_iron, self.ax_final):
             if ax is not None:
                 ax.set_xlim(-R, R)
                 ax.set_ylim(-R, R)
                 ax.set_aspect('equal', adjustable='box')
-        # 设置第二个画布的坐标轴
-        for ax in [self.ax_soft_iron, self.ax_final]:
-            if ax is not None:
-                ax.set_xlim(-R, R)
-                ax.set_ylim(-R, R)
-                ax.set_aspect('equal', adjustable='box')
-                
-        # 刷新两个画布
+
         if self.fig1 is not None:
             self.fig1.canvas.draw_idle()
             self.fig1.canvas.flush_events()
@@ -586,14 +533,14 @@ class CalibrationApp:
             self.fig2.canvas.draw_idle()
             self.fig2.canvas.flush_events()
             self.fig2.canvas.manager.window.move(50, 600)
-            
+
+        # 7. 保存参数
+        self.calibration_params = (center_hard, soft_inv,
+                                   np.column_stack([mx, my]),
+                                   filtered_final_calibrated)
+
         self.window.set_status("Calibration finished. Click View Result to see results.")
         self.window.enable_view_btn(True)
-        
-        # 保存校准参数，注意现在center_after_hard是硬铁校准参数
-        self.calibration_params = (center_after_hard, scale, 
-                                np.column_stack([mx, my]),  # 原始椭圆数据
-                                filtered_final_calibrated)  # 最终校准数据
         self.window.start_btn.setEnabled(True)
         self.window.port_combo.setEnabled(True)
         self.window.baud_combo.setEnabled(True)

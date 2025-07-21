@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import QApplication
 from compass_ui import CompassMainWindow
 
 import matplotlib.pyplot as plt
-from config import MAG_AXIS_MAP
+from config import MAG_AXIS_MAP_A, MAG_AXIS_MAP_B, SENSOR_TYPE  # 新增导入
 
 CALIBRATION_DURATION = 30  # seconds
 
@@ -380,7 +380,8 @@ class CalibrationApp:
 
     def map_mag_to_imu(self, mx, my, mz):
         mag = np.stack([mx, my, mz], axis=-1)
-        mag_imu = mag @ np.array(MAG_AXIS_MAP).T
+        mat = MAG_AXIS_MAP_A if SENSOR_TYPE == "A" else MAG_AXIS_MAP_B  # 仅改这一行
+        mag_imu = mag @ np.array(mat).T
         return mag_imu[..., 0], mag_imu[..., 1], mag_imu[..., 2]
 
     def on_serial_data(self, line):

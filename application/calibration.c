@@ -7,9 +7,9 @@
 #include <math.h>
 
 // 校准参数
-#define HARD_IRON_OFFSET_X 23.423173f
-#define HARD_IRON_OFFSET_Y 29.470875f
-#define SOFT_IRON_SCALE 0.924439f
+#define HARD_IRON_OFFSET_X 107.179958f
+#define HARD_IRON_OFFSET_Y 65.977530f
+#define SOFT_IRON_SCALE 1.061968f
 
 // 坐标系映射类型
 typedef enum {

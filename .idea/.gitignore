@@ -1,0 +1,8 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+
+application/**/*
+!application/**/*.py
+!application/**/*.c
+!application/**/*.h

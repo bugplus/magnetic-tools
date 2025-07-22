@@ -40,7 +40,8 @@ class SerialReader(threading.Thread):
 def fit_ellipsoid_3d(points):
     pts = np.array(points)
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, 1])
+    # 使用 np.ones_like 生成与 x, y, z 形状相同的数组
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
     coeffs, *_ = np.linalg.lstsq(D, 1, rcond=None)
     A, B, C, D, E, F, G, H, I, J = coeffs
     Q = np.array([[A, D/2, E/2], [D/2, B, F/2], [E/2, F/2, C]])

@@ -4,13 +4,14 @@ import threading
 import time
 import numpy as np
 import re
-from PyQt5.QtWidgets import QApplication
-from compass_ui import CompassMainWindow
-
 import matplotlib.pyplot as plt
-from config import MAG_AXIS_MAP_A, MAG_AXIS_MAP_B, SENSOR_TYPE  # 新增导入
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QComboBox, QHBoxLayout, QMessageBox, QFileDialog, QDialog, QTextEdit
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from compass_ui import CompassMainWindow
+from config import MAG_AXIS_MAP_A, MAG_AXIS_MAP_B, SENSOR_TYPE
 
-CALIBRATION_DURATION = 30  # seconds
+CALIBRATION_DURATION = 30
+MIN_3D_POINTS = 100
 
 class SerialReader(threading.Thread):
     def __init__(self, port, baudrate, callback):
@@ -19,6 +20,7 @@ class SerialReader(threading.Thread):
         self.baudrate = baudrate
         self.callback = callback
         self.running = False
+
     def run(self):
         self.running = True
         try:
@@ -31,539 +33,153 @@ class SerialReader(threading.Thread):
                     print(f"Serial read error: {e}")
         except Exception as e:
             print(f"Serial error: {e}")
+
     def stop(self):
         self.running = False
 
-def fit_circle_least_squares(xy):
-    x = xy[:, 0]
-    y = xy[:, 1]
-    A = np.c_[2*x, 2*y, np.ones(x.shape)]
-    b = x**2 + y**2
-    c, resid, rank, s = np.linalg.lstsq(A, b, rcond=None)
-    center_x, center_y = c[0], c[1]
-    radius = np.sqrt(c[2] + center_x**2 + center_y**2)
-    return np.array([center_x, center_y]), radius
+def fit_ellipsoid_3d(points):
+    pts = np.array(points)
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, 1])
+    coeffs, *_ = np.linalg.lstsq(D, 1, rcond=None)
+    A, B, C, D, E, F, G, H, I, J = coeffs
+    Q = np.array([[A, D/2, E/2], [D/2, B, F/2], [E/2, F/2, C]])
+    b = -np.linalg.solve(Q, [G, H, I]) / 2
+    Ainv = np.linalg.inv(Q)
+    scale = (1.0 / abs(np.linalg.det(Ainv)))**(1/3)
+    A_cal = Ainv * scale
+    return b, A_cal
 
-def calibrate_magnetometer_standard(xy):
-    # 1. Soft iron: scale y to match x radius (about origin)
-    radius_x = (np.max(xy[:, 0]) - np.min(xy[:, 0])) / 2
-    radius_y = (np.max(xy[:, 1]) - np.min(xy[:, 1])) / 2
-    scale = radius_x / radius_y if radius_y != 0 else 1.0
-    soft_calibrated = xy.copy()
-    soft_calibrated[:, 1] *= scale
-
-    # 2. Hard iron: fit circle center after scaling, then shift to origin
-    center, _ = fit_circle_least_squares(soft_calibrated)
-    hard_soft_calibrated = soft_calibrated - center
-
-    return soft_calibrated, hard_soft_calibrated, center, scale
-
-def calibrate_magnetometer_least_squares(xy):
-    center, _ = fit_circle_least_squares(xy)
-    shifted = xy - center
-    radius_x = (np.max(shifted[:, 0]) - np.min(shifted[:, 0])) / 2
-    radius_y = (np.max(shifted[:, 1]) - np.min(shifted[:, 1])) / 2
-    scale = radius_x / radius_y if radius_y != 0 else 1.0
-    calibrated = shifted.copy()
-    calibrated[:, 1] *= scale
-    return shifted, calibrated, center, scale
-
-def generate_c_code(center, soft_matrix):
-    """
-    根据上位机校准结果，生成可直接拷贝到单片机的 C 源文件。
-    参数：
-      center       : list/array [cx, cy]  硬铁偏移
-      soft_matrix  : 2×2 ndarray           软铁逆矩阵 [[a,b],[c,d]]
-    返回：
-      完整 C 字符串，含 typedef、接口、示例，可直接保存为 .c
-    """
-    cx, cy = center[0], center[1]
-    m = soft_matrix
-    c_code = f"""
-/*********************************************************************
- * 磁力计校准参数与接口 —— 2×2 非对角软铁矩阵版
- * 由上位机自动生成，勿手动修改数值
- *********************************************************************/
-#include <math.h>
-#include <stdio.h>
-
-/* ---------- 1. 校准参数 ---------- */
-#define HARD_IRON_OFFSET_X  ({cx:.6f}f)
-#define HARD_IRON_OFFSET_Y  ({cy:.6f}f)
-
-static const float SOFT_IRON_MATRIX[2][2] = {{
-    {{{m[0,0]:.6f}f, {m[0,1]:.6f}f}},
-    {{{m[1,0]:.6f}f, {m[1,1]:.6f}f}}
-}};
-
-/* ---------- 2. 数据结构 ---------- */
-typedef enum {{
-    MAPPING_TYPE_1 = 1,  /* X→Y, Y→X, Z→Z */
-    MAPPING_TYPE_2 = 2,  /* X→X, Y→Y, Z→Z */
-    MAPPING_TYPE_3 = 3   /* X→-X, Y→Y, Z→Z */
-}} mapping_type_t;
-
-typedef struct {{
-    float mag_x, mag_y, mag_z;
-    float pitch, roll, yaw;   /* 角度，单位：度 */
-    mapping_type_t mapping;
-}} tilt_input_t;
-
-typedef struct {{
-    float mx_comp, my_comp; /* 倾斜补偿后水平分量 */
-    float mx_cal,  my_cal;  /* 校准后最终分量 */
-}} tilt_output_t;
-
-/* ---------- 3. 坐标系映射 ---------- */
-static inline void map_coordinates(float mx, float my, float mz,
-                                   mapping_type_t m,
-                                   float *ox, float *oy, float *oz)
-{{
-    switch (m) {{
-        case MAPPING_TYPE_1: *ox = my; *oy = mx; *oz = mz; break;
-        case MAPPING_TYPE_2: *ox = mx; *oy = my; *oz = mz; break;
-        case MAPPING_TYPE_3: *ox = -mx; *oy = my; *oz = mz; break;
-        default:             *ox = mx; *oy = my; *oz = mz; break;
-    }}
-}}
-
-/* ---------- 4. 倾斜补偿 ---------- */
-static inline void tilt_compensation(const tilt_input_t *in, tilt_output_t *out)
-{{
-    float mx, my, mz;
-    map_coordinates(in->mag_x, in->mag_y, in->mag_z, in->mapping, &mx, &my, &mz);
-
-    float pr = in->pitch * (float)M_PI / 180.0f;
-    float rr = in->roll  * (float)M_PI / 180.0f;
-
-    float cp = cosf(pr), sp = sinf(pr);
-    float cr = cosf(rr), sr = sinf(rr);
-
-    out->mx_comp = mx * cp + mz * sp;
-    out->my_comp = mx * sp * sr + my * cr - mz * cp * sr;
-}}
-
-/* ---------- 5. 软铁/硬铁校准 ---------- */
-static inline void calibrate_magnetometer(float *mx, float *my)
-{{
-    /* 1. 硬铁偏移 */
-    float hx = *mx - HARD_IRON_OFFSET_X;
-    float hy = *my - HARD_IRON_OFFSET_Y;
-
-    /* 2. 2×2 非对角软铁矩阵乘法 */
-    *mx = SOFT_IRON_MATRIX[0][0] * hx + SOFT_IRON_MATRIX[0][1] * hy;
-    *my = SOFT_IRON_MATRIX[1][0] * hx + SOFT_IRON_MATRIX[1][1] * hy;
-}}
-
-/* ---------- 6. 完整处理 ---------- */
-static inline void process_magnetometer_data(const tilt_input_t *in,
-                                             tilt_output_t *out)
-{{
-    tilt_compensation(in, out);
-    calibrate_magnetometer(&out->mx_comp, &out->my_comp);
-    out->mx_cal = out->mx_comp;
-    out->my_cal = out->my_comp;
-}}
-
-/* ---------- 7. 使用示例 ---------- */
-void example_usage(void)
-{{
-    tilt_input_t in = {{
-        .mag_x = 247.0f, .mag_y = 137.0f, .mag_z = -57.0f,
-        .pitch = 62.46f, .roll = -1.01f, .yaw = -90.37f,
-        .mapping = MAPPING_TYPE_1
-    }};
-    tilt_output_t out;
-
-    process_magnetometer_data(&in, &out);
-
-    float heading = atan2f(out.my_cal, out.mx_cal) * 180.0f / (float)M_PI;
-    if (heading < 0.0f) heading += 360.0f;
-
-    printf("Compensated: mx=%.2f, my=%.2f\\n", out.mx_comp, out.my_comp);
-    printf("Calibrated : mx=%.2f, my=%.2f\\n", out.mx_cal,  out.my_cal);
-    printf("Heading    : %.1f°\\n", heading);
-}}
-
-/* 文件结束 */
-"""
-    return c_code
-
-def plot_two(raw_data, calibrated, center, soft_matrix):
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-
-    # 图 1：原始
-    ax1.set_title("Original Data (mx, my)")
-    ax1.axis('equal')
-    if raw_data is not None and len(raw_data) > 0:
-        ax1.plot(raw_data[:, 0], raw_data[:, 1], 'r.', alpha=0.7)
-    ax1.plot(0, 0, 'k+', markersize=10, mew=2)
-    ax1.grid(True, alpha=0.3)
-
-    # 图 2：倾斜补偿
-    ax2.set_title("Tilt Compensated Data")
-    ax2.axis('equal')
-    if raw_data is not None and len(raw_data) > 0:
-        ax2.plot(raw_data[:, 0], raw_data[:, 1], 'b.', alpha=0.7)
-    ax2.plot(0, 0, 'k+', markersize=10, mew=2)
-    ax2.grid(True, alpha=0.3)
-
-    # 图 3：硬铁后
-    ax3.set_title("Hard Iron Calibrated")
-    ax3.axis('equal')
-    if calibrated is not None and len(calibrated) > 0:
-        ax3.plot(calibrated[:, 0], calibrated[:, 1], 'b.', alpha=0.7)
-    ax3.plot(0, 0, 'k+', markersize=10, mew=2)
-    ax3.grid(True, alpha=0.3)
-
-    # 图 4：最终校准（矩阵标题 + 无 ndarray 格式化）
-    mat_str = f"[{soft_matrix[0,0]:.4f},{soft_matrix[0,1]:.4f};" \
-              f"{soft_matrix[1,0]:.4f},{soft_matrix[1,1]:.4f}]"
-    ax4.set_title(f"Final Calibrated (Hard + Soft Iron)\nMatrix: {mat_str}")
-    ax4.axis('equal')
-    if calibrated is not None and len(calibrated) > 0:
-        ax4.plot(calibrated[:, 0], calibrated[:, 1], 'g.', alpha=0.7)
-    ax4.plot(0, 0, 'k+', markersize=10, mew=2)
-    ax4.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
+def generate_c_code_3d(b, A):
+    bx, by, bz = b
+    lines = [
+        "/* 3D mag calibration (auto) */",
+        f"const float HARD_IRON[3] = {{{bx:.6f}f, {by:.6f}f, {bz:.6f}f}};",
+        "const float SOFT_IRON[3][3] = {",
+        f"  {{{A[0, 0]:.6f}f, {A[0, 1]:.6f}f, {A[0, 2]:.6f}f}},",
+        f"  {{{A[1, 0]:.6f}f, {A[1, 1]:.6f}f, {A[1, 2]:.6f}f}},",
+        f"  {{{A[2, 0]:.6f}f, {A[2, 1]:.6f}f, {A[2, 2]:.6f}f}}",
+        "};"
+    ]
+    return "\n".join(lines)
 
 class CalibrationApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.window = CompassMainWindow()
-        self.window.start_calibration_signal.connect(self.start_calibration)
-        self.window.view_result_signal.connect(self.view_result)
+
+        # 3D 信号
+        self.window.step0_done.connect(self.start_step1)
+        self.window.step1_done.connect(self.finish_steps)
+        self.window.view3d_done.connect(self.view_result_3d)
+
+        # 按钮
+        self.window.step0_btn.clicked.connect(self.on_step0_clicked)
+        self.window.step1_btn.clicked.connect(self.start_step1)
+        self.window.view3d_btn.clicked.connect(self.view_result_3d)
+
+        # 数据
+        self.mag3d_data = []
         self.serial_thread = None
-        self.raw_mag_data = []  # [mx, my, mz, roll, pitch, yaw]
-        self.calibrated = False
-        self.calibration_params = None
-        self.fig1 = None
-        self.fig2 = None
-        self.ax_original = None
-        self.ax_projected = None
-        self.ax_soft_iron = None
-        self.ax_final = None
-        self.original_plot = None
-        self.projected_plot = None
-        self._pending_mag = None  # 用于暂存mag行
-        self._pending_euler = None # 用于暂存欧拉角
-        self.last_xy = None     # 缓存上一次画过的点
+        self.step_stage = 0
 
-    def start_calibration(self, port, baudrate):
+        # 画布
+        self.fig3d = plt.figure()
+        self.canvas3d = FigureCanvas(self.fig3d)
+        self.ax3d = self.fig3d.add_subplot(111, projection='3d')
+        self.ax3d.set_title("3D Real-time Mag")
+        self.ax3d.set_xlim([-100, 100])
+        self.ax3d.set_ylim([-100, 100])
+        self.ax3d.set_zlim([-100, 100])
+        self.canvas3d.setParent(self.window.central)
+        self.window.central_layout.addWidget(self.canvas3d)
+
+    def _update_3d_plot(self):
+        if self.ax3d:
+            self.ax3d.clear()
+            xyz = np.array(self.mag3d_data)
+            if len(xyz) > 0:
+                x_min, x_max = np.min(xyz[:, 0]), np.max(xyz[:, 0])
+                y_min, y_max = np.min(xyz[:, 1]), np.max(xyz[:, 1])
+                z_min, z_max = np.min(xyz[:, 2]), np.max(xyz[:, 2])
+                self.ax3d.set_xlim([x_min - 10, x_max + 10])
+                self.ax3d.set_ylim([y_min - 10, y_max + 10])
+                self.ax3d.set_zlim([z_min - 10, z_max + 10])
+            self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
+            self.ax3d.set_title(f"3D points: {len(xyz)}")
+            self.canvas3d.draw()
+
+    def on_mag_only(self, line):
         try:
-            if self.fig1 is not None:
-                plt.close(self.fig1)
-            if self.fig2 is not None:
-                plt.close(self.fig2)
-        except Exception:
-            pass
-        self.fig1 = None
-        self.fig2 = None
-        self.ax_original = None
-        self.ax_projected = None
-        self.ax_soft_iron = None
-        self.ax_final = None
-        self.original_plot = None
-        self.projected_plot = None
+            if line.startswith('mag_x='):
+                vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
+                if vals:
+                    mx, my, mz = map(float, vals[0])
+                    self.mag3d_data.append([mx, my, mz])
+                    self._update_3d_plot()
+        except Exception as e:
+            print(f"3D Serial: {e}")
 
-        self.raw_mag_data.clear()
-        self.calibrated = False
-        self.calibration_params = None
-        self._pending_euler = None  # 清空待处理的欧拉角数据
-        self.window.clear_all_canvases()
-        self.window.set_status("Calibrating...")
-        self.serial_thread = SerialReader(port, baudrate, self.on_serial_data)
+    def on_step0_clicked(self):
+        port = self.window.port_combo.currentText()
+        baud = int(self.window.baud_combo.currentText())
+        if "No" in port:
+            QMessageBox.warning(self.window, "Error", "No port")
+            return
+        self.window.step0_btn.setEnabled(False)
+        self.start_step0(port, baud)
+
+    def start_step0(self, port, baud):
+        self.step_stage = 1
+        self.mag3d_data.clear()
+        self.window.set_status("3D Step1: level 30s...")
+        self.serial_thread = SerialReader(port, baud, self.on_mag_only)
         self.serial_thread.start()
-        self.calibration_start_time = time.time()
-        # 创建两个画布：第一个显示原始数据和投影数据，第二个显示校准过程
-        self.fig1, (self.ax_original, self.ax_projected) = plt.subplots(1, 2, figsize=(12, 5))
-        self.fig2, (self.ax_soft_iron, self.ax_final) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # 第一个画布：原始数据和倾斜补偿数据
-        self.ax_original.set_title("Original Data (mx, my)")
-        self.ax_projected.set_title("Tilt Compensated Data")
-        self.ax_original.axis('equal')
-        self.ax_projected.axis('equal')
-        
-        # 第二个画布：校准过程
-        self.ax_soft_iron.set_title("Hard Iron Calibrated")
-        self.ax_final.set_title("Final Calibrated (Hard + Soft Iron)")
-        self.ax_soft_iron.axis('equal')
-        self.ax_final.axis('equal')
-        
-        # 实时绘图对象
-        self.original_plot, = self.ax_original.plot([], [], 'r.', alpha=0.7)
-        self.projected_plot, = self.ax_projected.plot([], [], 'b.', alpha=0.7)
-        
-        plt.tight_layout()
-        self.fig1.show()
-        self.fig1.canvas.manager.window.move(50, 50)
-        self.fig2.show()
-        self.fig2.canvas.manager.window.move(50, 600)
-        threading.Thread(target=self._calibration_timer, daemon=True).start()
+        threading.Timer(CALIBRATION_DURATION, self.step_timeout).start()
 
-    def _calibration_timer(self):
-        while time.time() - self.calibration_start_time < CALIBRATION_DURATION:
-            time.sleep(0.1)
+    def start_step1(self):
+        if len(self.mag3d_data) < MIN_3D_POINTS // 2:
+            self.window.set_status(f"Step1 need ≥{MIN_3D_POINTS//2}")
+            return
+        self.step_stage = 2
+        self.window.set_status("3D Step2: nose-up 30s...")
+        self.serial_thread = SerialReader(
+            self.window.port_combo.currentText(),
+            int(self.window.baud_combo.currentText()),
+            self.on_mag_only)
+        self.serial_thread.start()
+        threading.Timer(CALIBRATION_DURATION, self.step_timeout).start()
+
+    def step_timeout(self):
         if self.serial_thread:
             self.serial_thread.stop()
-        self.perform_calibration()
+        if self.step_stage == 1:
+            self.window.enable_step1_btn(True)
+        elif self.step_stage == 2:
+            self.finish_steps()
 
-    def extract_mag(self, mag_line):
-        return [float(x) for x in re.findall(r'-?\d+\.?\d*', mag_line)]
-
-    def map_mag_to_imu(self, mx, my, mz):
-        mag = np.stack([mx, my, mz], axis=-1)
-        mat = MAG_AXIS_MAP_A if SENSOR_TYPE == "A" else MAG_AXIS_MAP_B  # 仅改这一行
-        mag_imu = mag @ np.array(mat).T
-        return mag_imu[..., 0], mag_imu[..., 1], mag_imu[..., 2]
-
-    def on_serial_data(self, line):
-        try:
-            # 适配你的数据格式：simples行、pitch行、mag_x行
-            if not line.strip():
-                return
-            if line.startswith('simples:'):
-                # 解析simples行：simples:62.463959,-1.012322,-90.374313,27.030861
-                vals = re.findall(r'simples:([\-\d\.]+),([\-\d\.]+),([\-\d\.]+),([\-\d\.]+)', line)
-                if vals:
-                    pitch, roll, yaw, testyaw = map(float, vals[0])
-                    self._pending_euler = (pitch, roll, yaw)
-            elif line.startswith('pitch='):
-                # 解析pitch行：pitch= 62.463959, roll= -1.012322,yaw= -90.374313, testyaw= 27.030861
-                vals = re.findall(r'pitch=\s*([\-\d\.]+),\s*roll=\s*([\-\d\.]+),\s*yaw=\s*([\-\d\.]+)', line)
-                if vals:
-                    pitch, roll, yaw = map(float, vals[0])
-                    self._pending_euler = (pitch, roll, yaw)
-            elif line.startswith('mag_x='):
-                # 解析mag_x行：mag_x=247, mag_y=137, mag_z=-57
-                vals = re.findall(r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line)
-                if vals and self._pending_euler is not None:
-                    mx, my, mz = map(float, vals[0])
-                    pitch, roll, yaw = self._pending_euler
-                    # 坐标系映射
-                    mx, my, mz = self.map_mag_to_imu(np.array([mx]), np.array([my]), np.array([mz]))
-                    mx, my, mz = mx[0], my[0], mz[0]
-                    self.raw_mag_data.append([mx, my, mz, roll, pitch, yaw])
-                    self._pending_euler = None
-                    print(f"Data paired: mag=({mx:.1f}, {my:.1f}, {mz:.1f}), euler=({roll:.1f}, {pitch:.1f}, {yaw:.1f})")
-                arr = np.array(self.raw_mag_data)
-                if arr.shape[0] > 0 and self.original_plot is not None and self.projected_plot is not None:
-                    # 显示原始数据（红色）
-                    mx, my, mz, roll, pitch, yaw = arr.T
-                    self.original_plot.set_data(mx, my)
-                    
-                    # 计算并显示倾斜补偿后的数据（蓝色）
-                    roll_rad = np.radians(roll)
-                    pitch_rad = np.radians(pitch)
-                    mxh, myh = [], []
-                    for i in range(len(mx)):
-                        # 使用标准的倾斜补偿公式
-                        cos_p = np.cos(pitch_rad[i])
-                        sin_p = np.sin(pitch_rad[i])
-                        cos_r = np.cos(roll_rad[i])
-                        sin_r = np.sin(roll_rad[i])
-                        
-                        # 标准倾斜补偿公式（使用旋转矩阵）
-                        # 先绕X轴旋转（pitch），再绕Y轴旋转（roll）
-                        mx_comp = mx[i] * cos_p + mz[i] * sin_p
-                        my_comp = mx[i] * sin_p * sin_r + my[i] * cos_r - mz[i] * cos_p * sin_r
-                        
-                        mxh.append(mx_comp)
-                        myh.append(my_comp)
-                    xy = np.stack([mxh, myh], axis=1)
-                    if self.last_xy is None or not np.array_equal(self.last_xy, xy):
-                        self.last_xy = xy
-                        self.projected_plot.set_data(xy[:, 0], xy[:, 1])
-                    self.projected_plot.set_data(xy[:, 0], xy[:, 1])
-                    
-                    # 显示统计信息
-                    print(f"Total points: {len(arr)}")
-                    print(f"Roll range: {roll.min():.1f}° to {roll.max():.1f}°")
-                    print(f"Pitch range: {pitch.min():.1f}° to {pitch.max():.1f}°")
-                    
-                    # 调试信息：显示一些数据点的对比
-                    if len(mx) > 10:
-                        print(f"Sample data point 0:")
-                        print(f"  Raw: mx={mx[0]:.1f}, my={my[0]:.1f}, mz={mz[0]:.1f}")
-                        print(f"  Euler: roll={roll[0]:.1f}°, pitch={pitch[0]:.1f}°, yaw={yaw[0]:.1f}°")
-                    
-                    # 更新坐标轴 - 确保能看到形状差异
-                    if self.ax_original is not None:
-                        self.ax_original.relim()
-                        self.ax_original.autoscale_view()
-                        self.ax_original.set_aspect('equal', adjustable='box')
-                    if self.ax_projected is not None:
-                        self.ax_projected.relim()
-                        self.ax_projected.autoscale_view()
-                        self.ax_projected.set_aspect('equal', adjustable='box')
-                    
-                    # 刷新画布
-                    if self.fig1 is not None:
-                        self.fig1.canvas.draw_idle()
-                        self.fig1.canvas.flush_events()
-                        self.fig1.canvas.manager.window.move(50, 50)
-        except Exception as e:
-            print(f"Serial data parsing error: {e}")
-            print(f"Problematic line: {line.strip()}")
-
-    def perform_calibration(self):
-        self.window.set_status("Calibration finished. Processing data...")
-        if len(self.raw_mag_data) < 10:
-            self.window.set_status("Not enough data for calibration.")
-            self.window.start_btn.setEnabled(True)
-            self.window.port_combo.setEnabled(True)
-            self.window.baud_combo.setEnabled(True)
-            self.window.refresh_btn.setEnabled(True)
+    def finish_steps(self):
+        if len(self.mag3d_data) < MIN_3D_POINTS:
+            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS}")
             return
-
-        arr = np.array(self.raw_mag_data)
-        mx, my, mz, roll, pitch, yaw = arr.T
-
-        # 1. 倾斜补偿
-        roll_rad = np.radians(roll)
-        pitch_rad = np.radians(pitch)
-        xy = []
-        for i in range(len(mx)):
-            cp = np.cos(pitch_rad[i])
-            sp = np.sin(pitch_rad[i])
-            cr = np.cos(roll_rad[i])
-            sr = np.sin(roll_rad[i])
-            mx_c = mx[i] * cp + mz[i] * sp
-            my_c = mx[i] * sp * sr + my[i] * cr - mz[i] * cp * sr
-            xy.append([mx_c, my_c])
-        xy = np.array(xy)
-
-        # 2. 硬铁校准
-        center_hard, _ = fit_circle_least_squares(xy)
-        hard_calibrated = xy - center_hard
-
-        # 3. 真 2×2 非对角软铁矩阵（带稳定性保护）
-        x, y = hard_calibrated[:, 0], hard_calibrated[:, 1]
-        Dmat = np.column_stack([x * x, x * y, y * y, x, y, np.ones_like(x)])
-        lam = 1e-6 * np.trace(Dmat.T @ Dmat) / Dmat.shape[0]
-        coeffs, *_ = np.linalg.lstsq(Dmat.T @ Dmat + lam * np.eye(Dmat.shape[1]),
-                                     Dmat.T @ np.ones_like(x), rcond=None)
-        A, B, C, _, _, _ = coeffs
-        Q = np.array([[A, B / 2], [B / 2, C]])
-        det = np.linalg.det(Q)
-        if abs(det) < 1e-6:  # 退化 → 单轴缩放
-            rx = np.ptp(hard_calibrated[:, 0]) or 1.0
-            ry = np.ptp(hard_calibrated[:, 1]) or 1.0
-            scale = rx / ry if ry else 1.0
-            soft_inv = np.array([[1.0, 0.0], [0.0, scale]])
-        else:
-            soft_inv = np.linalg.inv(Q)
-        soft_calibrated = (soft_inv @ hard_calibrated.T).T
-        final_calibrated = soft_calibrated
-
-        # 4. 离群过滤
-        dist = np.linalg.norm(final_calibrated, axis=1)
-        median = np.median(dist)
-        std = np.std(dist)
-        mask = np.abs(dist - median) < 3 * std
-        filtered_final_calibrated = final_calibrated[mask]
-
-        # 5. 绘图（已补回圆心原点）
-        # 图 1：原始数据
-        if self.ax_original is not None:
-            self.ax_original.clear()
-            self.ax_original.plot(np.column_stack([mx, my])[:, 0],
-                                  np.column_stack([mx, my])[:, 1], 'r.', alpha=0.7)
-            self.ax_original.plot(0, 0, 'k+', markersize=10, mew=2)
-            self.ax_original.set_title("Original Data (mx, my)")
-            self.ax_original.grid(True, alpha=0.3)
-
-        # 图 2：倾斜补偿
-        if self.ax_projected is not None:
-            self.ax_projected.clear()
-            self.ax_projected.plot(xy[:, 0], xy[:, 1], 'b.', alpha=0.7)
-            self.ax_projected.plot(center_hard[0], center_hard[1], 'ro', label='Center')
-            self.ax_projected.plot(0, 0, 'k+', markersize=10, mew=2)
-            self.ax_projected.legend()
-            self.ax_projected.set_title("Tilt Compensated Data")
-            self.ax_projected.grid(True, alpha=0.3)
-
-        # 图 3：硬铁后（已补原点）
-        if self.ax_soft_iron is not None:
-            self.ax_soft_iron.clear()
-            self.ax_soft_iron.plot(hard_calibrated[:, 0], hard_calibrated[:, 1], 'r.', alpha=0.7)
-            self.ax_soft_iron.plot(0, 0, 'k+', markersize=10, mew=2)
-            self.ax_soft_iron.set_title("Hard Iron Calibrated")
-            self.ax_soft_iron.grid(True, alpha=0.3)
-
-        # 图 4：最终校准（已补原点）
-        if self.ax_final is not None:
-            self.ax_final.clear()
-            self.ax_final.plot(filtered_final_calibrated[:, 0],
-                               filtered_final_calibrated[:, 1], 'g.', alpha=0.7)
-            self.ax_final.plot(0, 0, 'k+', markersize=10, mew=2)
-            self.ax_final.set_title("Final Calibrated (Hard + Soft Iron)")
-            self.ax_final.grid(True, alpha=0.3)
-
-        # 统一坐标轴
-        R = max(np.abs(hard_calibrated).max(), np.abs(filtered_final_calibrated).max())
-        for ax in (self.ax_original, self.ax_projected, self.ax_soft_iron, self.ax_final):
-            if ax is not None:
-                ax.set_xlim(-R, R)
-                ax.set_ylim(-R, R)
-                ax.set_aspect('equal', adjustable='box')
-
-        if self.fig1 is not None:
-            self.fig1.canvas.draw_idle(); self.fig1.canvas.flush_events()
-        if self.fig2 is not None:
-            self.fig2.canvas.draw_idle(); self.fig2.canvas.flush_events()
-
-        # 6. 保存参数
-        self.calibration_params = (center_hard, soft_inv,
-                                   np.column_stack([mx, my]),
-                                   filtered_final_calibrated)
-
-        self.window.set_status("Calibration finished. Click View Result to see results.")
-        self.window.enable_view_btn(True)
-        self.window.start_btn.setEnabled(True)
-        self.window.port_combo.setEnabled(True)
-        self.window.baud_combo.setEnabled(True)
-        self.window.refresh_btn.setEnabled(True)
-
-    def view_result(self):
-        if not self.calibration_params:
-            self.window.set_status("Please finish calibration first.")
-            return
-
-        center, soft_matrix, original_data, calibrated = self.calibration_params
-
-        # 1. 生成 C 代码
-        c_code = generate_c_code(center, soft_matrix)
-
-        # 2. 只画两张图：源数据 + 算法结果
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-        # 图 1：原始椭圆（未经任何校准）
-        ax1.set_title("Original Ellipse Data")
-        ax1.axis('equal')
-        if original_data is not None and len(original_data) > 0:
-            ax1.plot(original_data[:, 0], original_data[:, 1], 'r.', alpha=0.7)
-        ax1.plot(0, 0, 'k+', markersize=10, mew=2)
-        ax1.grid(True, alpha=0.3)
-
-        # 图 2：算法后的圆数据（硬铁 + 真 2×2 软铁）
-        ax2.set_title("Final Calibrated Data")
-        ax2.axis('equal')
-        if calibrated is not None and len(calibrated) > 0:
-            ax2.plot(calibrated[:, 0], calibrated[:, 1], 'g.', alpha=0.7)
-        ax2.plot(0, 0, 'k+', markersize=10, mew=2)
-        ax2.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.show()
-
-        # 3. 弹出 C 代码
+        b, A = fit_ellipsoid_3d(self.mag3d_data)
+        c_code = generate_c_code_3d(b, A)
         self.window.show_result_dialog(c_code)
+        self.window.enable_view3d_btn(True)
+        self.window.set_status("3D Done")
 
+    def view_result_3d(self):
+        if len(self.mag3d_data) < MIN_3D_POINTS:
+            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS}")
+            return
+        b, A = fit_ellipsoid_3d(self.mag3d_data)
+        c_code = generate_c_code_3d(b, A)
+        self.window.show_result_dialog(c_code)
 
     def run(self):
         self.window.show()
         sys.exit(self.app.exec_())
+
+if __name__ == "__main__":
+    app = CalibrationApp()
+    app.run()

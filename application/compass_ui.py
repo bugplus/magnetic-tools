@@ -9,54 +9,59 @@ import re
 class ResultDialog(QDialog):
     def __init__(self, c_code, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("C语言校准代码")
+        self.setWindowTitle("C Calibration Code")
         layout = QVBoxLayout(self)
-        code_label = QLabel("自动生成C语言校准代码：")
+        code_label = QLabel("Copy & paste into your firmware:")
         layout.addWidget(code_label)
         code_box = QTextEdit()
         code_box.setReadOnly(True)
         code_box.setPlainText(c_code)
         layout.addWidget(code_box)
-        save_btn = QPushButton("保存C代码")
+        save_btn = QPushButton("Save .c")
         save_btn.clicked.connect(lambda: self.save_code(c_code))
         layout.addWidget(save_btn)
 
     def save_code(self, c_code):
-        fname, _ = QFileDialog.getSaveFileName(self, "保存C代码", "calibration.c", "C Files (*.c)")
+        fname, _ = QFileDialog.getSaveFileName(self, "Save C", "calibration.c", "C Files (*.c)")
         if fname:
             with open(fname, "w", encoding="utf-8") as f:
                 f.write(c_code)
-            QMessageBox.information(self, "保存成功", f"已保存到 {fname}")
+            QMessageBox.information(self, "Saved", f"Saved to {fname}")
 
 class CompassMainWindow(QMainWindow):
     start_calibration_signal = pyqtSignal(str, int)
     view_result_signal = pyqtSignal()
+    step0_done = pyqtSignal()
+    step1_done = pyqtSignal()
+    view3d_done = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("磁罗盘校准工具")
+        self.setWindowTitle("Magnetic Compass Calibrator")
         self.resize(600, 200)
         self.central = QWidget()
         self.setCentralWidget(self.central)
-        self.main_layout = QVBoxLayout(self.central)
 
-        # 串口选择区
+        # 初始化 central_layout
+        self.central_layout = QVBoxLayout(self.central)
+
+        # Port & baud
         port_layout = QHBoxLayout()
         self.port_combo = QComboBox()
         self.refresh_ports()
-        port_layout.addWidget(QLabel("串口号:"))
+        port_layout.addWidget(QLabel("Port:"))
         port_layout.addWidget(self.port_combo)
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["9600", "115200"])
         self.baud_combo.setCurrentText("115200")
-        port_layout.addWidget(QLabel("波特率:"))
+        port_layout.addWidget(QLabel("Baud:"))
         port_layout.addWidget(self.baud_combo)
-        self.refresh_btn = QPushButton("刷新串口")
+        self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh_ports)
         port_layout.addWidget(self.refresh_btn)
-        self.main_layout.addLayout(port_layout)
+        self.central_layout.addLayout(port_layout)
 
-        # 控制按钮
+        # Buttons
         btn_layout = QHBoxLayout()
         self.start_btn = QPushButton("Start Calibration")
         self.start_btn.clicked.connect(self.on_start)
@@ -65,11 +70,22 @@ class CompassMainWindow(QMainWindow):
         self.view_btn.clicked.connect(self.on_view_result)
         self.view_btn.setEnabled(False)
         btn_layout.addWidget(self.view_btn)
-        self.main_layout.addLayout(btn_layout)
 
-        # 状态栏
-        self.status_label = QLabel("请连接设备并选择串口")
-        self.main_layout.addWidget(self.status_label)
+        # 3D buttons
+        self.step0_btn = QPushButton("3D-Step1 Level")
+        self.step1_btn = QPushButton("3D-Step2 NoseUp")
+        self.view3d_btn = QPushButton("3D-View")
+        btn_layout.addWidget(self.step0_btn)
+        btn_layout.addWidget(self.step1_btn)
+        btn_layout.addWidget(self.view3d_btn)
+        self.step1_btn.setEnabled(False)
+        self.view3d_btn.setEnabled(False)
+
+        self.central_layout.addLayout(btn_layout)
+
+        # Status
+        self.status_label = QLabel("Select port and start")
+        self.central_layout.addWidget(self.status_label)
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -77,41 +93,42 @@ class CompassMainWindow(QMainWindow):
         for p in ports:
             self.port_combo.addItem(p.device)
         if not ports:
-            self.port_combo.addItem("无可用串口")
+            self.port_combo.addItem("No ports")
 
     def on_start(self):
         port = self.port_combo.currentText()
         baud = int(self.baud_combo.currentText())
-        if "无可用串口" in port:
-            QMessageBox.warning(self, "错误", "未检测到串口")
+        if "No ports" in port:
+            QMessageBox.warning(self, "Error", "No port")
             return
         self.start_btn.setEnabled(False)
         self.port_combo.setEnabled(False)
         self.baud_combo.setEnabled(False)
         self.refresh_btn.setEnabled(False)
-        self.status_label.setText("校准中...")
         self.view_btn.setEnabled(False)
         self.start_calibration_signal.emit(port, baud)
+
+    def on_step0(self):
+        port = self.port_combo.currentText()
+        baud = int(self.baud_combo.currentText())
+        if "No ports" in port:
+            QMessageBox.warning(self, "Error", "No port")
+            return
+        self.step0_btn.setEnabled(False)
+        self.start_calibration_signal.emit(port, baud)
+
+    def on_step1(self):
+        self.step1_btn.setEnabled(False)
+        self.step1_done.emit()
 
     def on_view_result(self):
         self.view_result_signal.emit()
 
+    def on_view3d(self):
+        self.view3d_done.emit()
+
     def set_status(self, text):
         self.status_label.setText(text)
-
-    def show_serial_line(self, line):
-        # 新增：在状态栏下方显示串口原始数据
-        if not hasattr(self, '_serial_label'):
-            from PyQt5.QtWidgets import QLabel
-            self._serial_label = QLabel()
-            self.main_layout.addWidget(self._serial_label)
-        self._serial_label.setText(f'串口数据: {line}')
-
-    def clear_all_canvases(self):
-        pass  # 兼容旧接口，无实际操作
-
-    def update_all_canvases(self, raw_data, shifted, calibrated):
-        pass  # 兼容旧接口，无实际操作
 
     def show_result_dialog(self, c_code):
         dlg = ResultDialog(c_code, self)
@@ -119,3 +136,9 @@ class CompassMainWindow(QMainWindow):
 
     def enable_view_btn(self, enable=True):
         self.view_btn.setEnabled(enable)
+
+    def enable_step1_btn(self, enable=True):
+        self.step1_btn.setEnabled(enable)
+
+    def enable_view3d_btn(self, enable=True):
+        self.view3d_btn.setEnabled(enable)

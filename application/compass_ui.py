@@ -3,30 +3,37 @@ from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QMessageBox, QFileDialog, QDialog, QTextEdit
 )
 from PyQt5.QtCore import pyqtSignal
-import serial.tools.list_ports
-import re
+import serial.tools.list_ports  # 确保导入 serial 模块
+from PyQt5.QtCore import pyqtSlot  # ✅ 确保导入
+
 
 class ResultDialog(QDialog):
     def __init__(self, c_code, parent=None):
         super().__init__(parent)
         self.setWindowTitle("C Calibration Code")
         layout = QVBoxLayout(self)
+
         code_label = QLabel("Copy & paste into your firmware:")
         layout.addWidget(code_label)
-        code_box = QTextEdit()
-        code_box.setReadOnly(True)
-        code_box.setPlainText(c_code)
-        layout.addWidget(code_box)
+
+        self.code_box = QTextEdit()  # ✅ 加上 self.
+        self.code_box.setReadOnly(True)
+        self.code_box.setPlainText(c_code)
+        layout.addWidget(self.code_box)
+
         save_btn = QPushButton("Save .c")
-        save_btn.clicked.connect(lambda: self.save_code(c_code))
+        save_btn.clicked.connect(self.save_code)
         layout.addWidget(save_btn)
 
-    def save_code(self, c_code):
+    def save_code(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save C", "calibration.c", "C Files (*.c)")
         if fname:
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write(c_code)
-            QMessageBox.information(self, "Saved", f"Saved to {fname}")
+            try:
+                with open(fname, "w", encoding="utf-8") as f:
+                    f.write(self.code_box.toPlainText())  # ✅ 现在不会报错了
+                QMessageBox.information(self, "Saved", f"Saved to {fname}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Failed", f"Failed to save file:\n{str(e)}")
 
 class CompassMainWindow(QMainWindow):
     start_calibration_signal = pyqtSignal(str, int)
@@ -34,6 +41,7 @@ class CompassMainWindow(QMainWindow):
     step0_done = pyqtSignal()
     step1_done = pyqtSignal()
     view3d_done = pyqtSignal()
+    show_result_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -130,9 +138,6 @@ class CompassMainWindow(QMainWindow):
     def set_status(self, text):
         self.status_label.setText(text)
 
-    def show_result_dialog(self, c_code):
-        dlg = ResultDialog(c_code, self)
-        dlg.exec_()
 
     def enable_view_btn(self, enable=True):
         self.view_btn.setEnabled(enable)
@@ -142,3 +147,8 @@ class CompassMainWindow(QMainWindow):
 
     def enable_view3d_btn(self, enable=True):
         self.view3d_btn.setEnabled(enable)
+
+    @pyqtSlot(str)  # ✅ 加上这个装饰器
+    def show_result_dialog(self, c_code):
+        dlg = ResultDialog(c_code, self)
+        dlg.exec_()

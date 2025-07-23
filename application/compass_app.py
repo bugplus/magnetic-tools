@@ -57,32 +57,47 @@ class SerialThread(QThread):
 # -----------------------------
 def fit_ellipsoid_3d(points):
     """
-    仅校正硬铁 + 软铁方向畸变，保留原始尺度与倾角。
-    返回：
-        b   : 硬铁偏移
-        A   : 无缩放的软铁矩阵（det(A) ≈ 1）
+    鲁棒椭球拟合：硬铁 + 软铁
+    返回 b, A；失败返回 None, None
     """
-    try:
-        pts = np.array(points)
-        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-        D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
-        coeffs, *_ = np.linalg.lstsq(D, np.ones_like(x), rcond=None)
-        A, B, C, D, E, F, G, H, I, J = coeffs
-        Q = np.array([[A, D/2, E/2], [D/2, B, F/2], [E/2, F/2, C]])
-        b = -np.linalg.solve(Q, [G, H, I]) / 2
-
-        from scipy.linalg import polar
-        R, S = polar(Q)
-        A_shape = np.linalg.inv(S)        # 只保留形状
-        A_cal = A_shape
-        # 交换 Y-Z 轴，使 nose-up 圆环竖起来
-        # A_cal = A_cal[:, [0, 2, 1]]
-        # A_cal = A_cal[[0, 2, 1], :]
-        print("软铁矩阵 A =\n", A_cal)   # ← 加在这里
-        return b, A_cal
-    except Exception as e:
-        print(f"Error in fit_ellipsoid_3d: {e}")
+    pts = np.asarray(points, dtype=float)
+    if pts.shape[0] < 10:
+        print("点数不足 10")
         return None, None
+
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
+
+    # 1) Tikhonov 正则化：加 λI，避免病态
+    lam = 1e-6 * np.trace(D.T @ D) / D.shape[1]
+    DTD = D.T @ D + lam * np.eye(10)
+    DTy = D.T @ np.ones_like(x)
+
+    try:
+        coeffs = np.linalg.solve(DTD, DTy)     # 正则化最小二乘
+    except np.linalg.LinAlgError:
+        print("正则化后仍无法求解")
+        return None, None
+
+    Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
+    Q = np.array([[Aq, Dq/2, Eq/2],
+                  [Dq/2, Bq, Fq/2],
+                  [Eq/2, Fq/2, Cq]])
+
+    # 2) 强制正定：负特征值→截断+偏移
+    eig_vals, eig_vecs = np.linalg.eigh(Q)
+    eig_vals = np.maximum(eig_vals, 1e-6)      # 截断负值
+    if np.any(eig_vals <= 0):
+        print("强制正定后仍失败")
+        return None, None
+
+    # 3) 计算硬铁偏移 & 软铁矩阵
+    b = -np.linalg.solve(Q, [G, H, I]) / 2
+    scale = np.sqrt(1.0 / eig_vals)
+    A_cal = eig_vecs @ np.diag(scale) @ eig_vecs.T
+    A_cal = np.linalg.inv(A_cal)
+
+    return b, A_cal
 
 def generate_c_code_3d(b, A):
     if b is None or A is None:

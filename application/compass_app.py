@@ -250,6 +250,18 @@ class CalibrationApp(QObject):
         err_pct = r_std / r_mean * 100
         print(f"球体误差：±{r_std:.1f} μT  (±{err_pct:.1f}%)")
 
+        # ===== 无干扰环境判定 & 近似值对比 =====
+        # 1. 环境判定：原始磁场与当地地磁差异
+        BE = 45.0  # 根据当地实际地磁值替换
+        B_raw_mag = np.linalg.norm(xyz, axis=1)
+        delta_env = np.abs(B_raw_mag - BE)
+        print(f"环境偏差：Emax={delta_env.max():.2f} µT, Emean={delta_env.mean():.2f} µT")
+
+        # 2. 校准前后近似值对比
+        delta_cal = np.linalg.norm(xyz - pts_cal_unit * scale, axis=1)
+        print(f"校准差值：Emax={delta_cal.max():.2f} µT, Emean={delta_cal.mean():.2f} µT")
+        # =====================================
+
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
         sc = self.ax3d_cal.scatter(
@@ -273,40 +285,52 @@ class CalibrationApp(QObject):
 
         xyz = np.array(self.freeze_data)
         half = len(xyz) // 2
-        level_pts = xyz[:half]
-        tilt_pts = xyz[half:]
 
-        # 原始图
-        self.ax3d.clear()
-        if len(level_pts) > 0:
-            self.ax3d.scatter(level_pts[:, 0], level_pts[:, 1], level_pts[:, 2],
-                              c='blue', s=8, label='Level (horizontal)')
-        if len(tilt_pts) > 0:
-            self.ax3d.scatter(tilt_pts[:, 0], tilt_pts[:, 1], tilt_pts[:, 2],
-                              c='orange', s=8, label='Tilt (nose-up)')
-        self.ax3d.set_title("Raw Mag Data: Level vs Tilt")
-        self.ax3d.set_box_aspect([1, 1, 1])
-        self.ax3d.legend()
-        self.canvas3d.draw()
+        # 原始点分段
+        level_raw = xyz[:half]
+        tilt_raw  = xyz[half:]
 
-        # 校准后图
+        # 校准点分段（完全同步）
         pts_centered = xyz - self.freeze_b
         pts_cal = (self.freeze_A @ pts_centered.T).T
         norms = np.linalg.norm(pts_cal, axis=1, keepdims=True)
         pts_cal_unit = pts_cal / norms
-        print(f"[DEBUG] 归一化尺度因子：{norms.mean():.4f}")
+        level_cal = pts_cal_unit[:half]
+        tilt_cal  = pts_cal_unit[half:]
 
+        # -----------------------------
+        # 1. 原始图
+        # -----------------------------
+        self.ax3d.clear()
+        if len(level_raw) > 0:
+            self.ax3d.scatter(level_raw[:, 0], level_raw[:, 1], level_raw[:, 2],
+                            c='#ff0080', s=8, label='Level', depthshade=True)
+        if len(tilt_raw) > 0:
+            self.ax3d.scatter(tilt_raw[:, 0], tilt_raw[:, 1], tilt_raw[:, 2],
+                            c='#00e5ff', s=8, label='Tilt', depthshade=True)
+        self.ax3d.set_title("Raw Mag Data: Level vs Tilt")
+        self.ax3d.set_box_aspect([1, 1, 1])
+        self.ax3d.legend()
+
+        # -----------------------------
+        # 2. 校准图
+        # -----------------------------
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
-        self.ax3d_cal.scatter(
-            pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
-            c='green', s=4, label='Calibrated'
-        )
+        if len(level_cal) > 0:
+            self.ax3d_cal.scatter(level_cal[:, 0], level_cal[:, 1], level_cal[:, 2],
+                                c='#ff0080', s=4, label='Level (cal)', depthshade=True)
+        if len(tilt_cal) > 0:
+            self.ax3d_cal.scatter(tilt_cal[:, 0], tilt_cal[:, 1], tilt_cal[:, 2],
+                                c='#00e5ff', s=4, label='Tilt (cal)', depthshade=True)
+
         self.ax3d_cal.set_title("Calibrated Mag on Sphere")
         self.ax3d_cal.set_box_aspect([1, 1, 1])
         self.ax3d_cal.legend()
 
-        # 动画旋转
+        # -----------------------------
+        # 3. 旋转动画（可选）
+        # -----------------------------
         def rotate(i):
             angle = (i % 360)
             self.ax3d.view_init(elev=20, azim=angle)

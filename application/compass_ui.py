@@ -85,11 +85,16 @@ class CompassMainWindow(QMainWindow):
         # 3D buttons
         self.step0_btn = QPushButton("3D-Step1 Level")
         self.step1_btn = QPushButton("3D-Step2 NoseUp")
+        self.step2_btn = QPushButton("3D-Step3 SternUp")   # ←新增
         self.view3d_btn = QPushButton("3D-View")
+
         btn_layout.addWidget(self.step0_btn)
         btn_layout.addWidget(self.step1_btn)
+        btn_layout.addWidget(self.step2_btn)   # ←新增
         btn_layout.addWidget(self.view3d_btn)
+
         self.step1_btn.setEnabled(False)
+        self.step2_btn.setEnabled(False)       # ←新增
         self.view3d_btn.setEnabled(False)
 
         self.central_layout.addLayout(btn_layout)

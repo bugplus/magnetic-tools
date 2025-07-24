@@ -17,38 +17,42 @@ from PyQt5.QtCore import (
 )
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.colors import LightSource
-
-CALIBRATION_DURATION = 30
-MIN_3D_POINTS = 100
+from config import CALIBRATION_DURATION, MIN_3D_POINTS
 
 # -----------------------------
-# 1. 线程安全串口读取
+# 1. 线程安全串口读取（带角度门控+稀疏化）
 # -----------------------------
 class DataBridge(QObject):
-    new_data = pyqtSignal(float, float, float)
+    new_data = pyqtSignal(float, float, float, float, float)  # mx,my,mz,pitch,roll
 
 class SerialThread(QThread):
     def __init__(self, port, baud, bridge):
         super().__init__()
         self.bridge = bridge
-        self.port = port
-        self.baud = baud
+        self.port, self.baud = port, baud
         self.running = True
+        self.cache_mag = None
+        self.cache_ang = None
 
     def run(self):
+        import numpy as np, re, serial
         try:
             with serial.Serial(self.port, self.baud, timeout=1) as ser:
                 while self.running:
                     line = ser.readline().decode(errors='ignore')
-                    if line.startswith('mag_x='):
-                        vals = re.findall(
-                            r'mag_x=\s*([\-\d\.]+),\s*mag_y=\s*([\-\d\.]+),\s*mag_z=\s*([\-\d\.]+)', line
-                        )
-                        if vals:
-                            mx, my, mz = map(float, vals[0])
-                            self.bridge.new_data.emit(mx, my, mz)
+                    m = re.search(r'mag_x=\s*([-\d\.]+),\s*mag_y=\s*([-\d\.]+),\s*mag_z=\s*([-\d\.]+)', line)
+                    if m:
+                        self.cache_mag = list(map(float, m.groups()))
+                    a = re.search(r'pitch=\s*([-\d\.]+).*roll=\s*([-\d\.]+).*yaw=\s*([-\d\.]+)', line)
+                    if a:
+                        self.cache_ang = list(map(float, a.groups()))
+                    if self.cache_mag and self.cache_ang:
+                        mx, my, mz = -self.cache_mag[1], -self.cache_mag[0], self.cache_mag[2]
+                        pitch, roll, _ = self.cache_ang
+                        self.bridge.new_data.emit(mx, my, mz, pitch, roll)
+                        self.cache_mag = self.cache_ang = None
         except Exception as e:
-            print(f"Serial error: {e}")
+            print("Serial error:", e)
 
     def stop(self):
         self.running = False
@@ -123,7 +127,7 @@ def draw_unit_sphere(ax, r=1.0):
     ax.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
 
 # -----------------------------
-# 3. CalibrationApp
+# 3. CalibrationApp（三步校准）
 # -----------------------------
 class CalibrationApp(QObject):
     def __init__(self):
@@ -147,7 +151,7 @@ class CalibrationApp(QObject):
 
         # 数据桥
         self.data_bridge = DataBridge()
-        self.data_bridge.new_data[float, float, float].connect(
+        self.data_bridge.new_data[float, float, float, float, float].connect(
             self.handle_new_data, Qt.QueuedConnection)
 
         self.mag3d_data = []
@@ -159,15 +163,11 @@ class CalibrationApp(QObject):
         # 按钮连接
         self.window.step0_btn.clicked.connect(self.on_step0_clicked)
         self.window.step1_btn.clicked.connect(self.start_step1)
+        self.window.step2_btn.clicked.connect(self.start_step2)
         self.window.view3d_btn.clicked.connect(self.view_result_3d)
 
-        # 新增按钮：算法 3D 视图
-        self.window.algo3d_btn = QPushButton("算法 3D 视图")
-        self.window.central_layout.addWidget(self.window.algo3d_btn)
-        self.window.algo3d_btn.clicked.connect(self.on_algo3d)
-
-    @pyqtSlot(float, float, float)
-    def handle_new_data(self, mx, my, mz):
+    @pyqtSlot(float, float, float, float, float)
+    def handle_new_data(self, mx, my, mz, pitch, roll):
         if self.freeze_data is None:
             self.mag3d_data.append([mx, my, mz])
 
@@ -199,29 +199,42 @@ class CalibrationApp(QObject):
     def start_step0(self, port, baud):
         self.mag3d_data.clear()
         self.freeze_data = None
-        self.window.set_status("3D Step1: level 30s...")
+        self.window.set_status("3D Step1: level 60s...")
         self.thread = SerialThread(port, baud, self.data_bridge)
         self.thread.start()
         QTimer.singleShot(CALIBRATION_DURATION * 1000, self.thread.stop)
         QTimer.singleShot(CALIBRATION_DURATION * 1000,
-                          lambda: self.window.enable_step1_btn(True))
+                          lambda: self.window.step1_btn.setEnabled(True))
 
     def start_step1(self):
-        if len(self.mag3d_data) < MIN_3D_POINTS // 2:
-            self.window.set_status(f"Step1 need ≥{MIN_3D_POINTS//2}")
+        if len(self.mag3d_data) < MIN_3D_POINTS:
+            self.window.set_status(f"Step1 need ≥{MIN_3D_POINTS}")
             return
         port = self.window.port_combo.currentText()
         baud = int(self.window.baud_combo.currentText())
         self.thread = SerialThread(port, baud, self.data_bridge)
         self.thread.start()
-        self.window.set_status("3D Step2: nose-up 30s...")
+        self.window.set_status("3D Step2: nose-up 60s...")
+        QTimer.singleShot(CALIBRATION_DURATION * 1000, self.thread.stop)
+        QTimer.singleShot(CALIBRATION_DURATION * 1000,
+                          lambda: self.window.step2_btn.setEnabled(True))
+
+    def start_step2(self):
+        if len(self.mag3d_data) < int(MIN_3D_POINTS * 1.5):
+            self.window.set_status(f"Step2 need ≥{int(MIN_3D_POINTS * 1.5)}")
+            return
+        port = self.window.port_combo.currentText()
+        baud = int(self.window.baud_combo.currentText())
+        self.thread = SerialThread(port, baud, self.data_bridge)
+        self.thread.start()
+        self.window.set_status("3D Step3: stern-up 60s...")
         QTimer.singleShot(CALIBRATION_DURATION * 1000, self.finish_steps)
 
     def finish_steps(self):
         if self.thread:
             self.thread.stop()
-        if len(self.mag3d_data) < MIN_3D_POINTS:
-            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS}")
+        if len(self.mag3d_data) < MIN_3D_POINTS * 2:
+            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS * 2}")
             return
         self.freeze_data = list(self.mag3d_data)
         self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
@@ -251,87 +264,27 @@ class CalibrationApp(QObject):
         self.canvas3d_cal.draw()
 
         c_code = generate_c_code_3d(self.freeze_b, self.freeze_A)
-        # ========= 保存原始数据 CSV =========
         csv_path = QFileDialog.getSaveFileName(
             self.window, "保存原始数据 CSV", "raw_mag.csv", "CSV (*.csv)")[0]
         if csv_path:
             np.savetxt(csv_path, np.array(self.freeze_data),
                        delimiter=',', fmt='%.6f')
-        # ====================================
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
-        self.window.set_status("3D Done")
-
-    @pyqtSlot()
-    def on_algo3d(self):
-        """CSV -> Calibrate -> 3D view (same color & interaction as 3D-View)"""
-        fname, _ = QFileDialog.getOpenFileName(
-            self.window, "Select CSV", "", "CSV (*.csv)")
-        if not fname:
-            return
-        try:
-            raw = np.loadtxt(fname, delimiter=',', ndmin=2)
-            if raw.shape[1] != 3:
-                raise ValueError("CSV must be N×3")
-            b, A = fit_ellipsoid_3d(raw)
-            if b is None or A is None:
-                QMessageBox.warning(self.window, "Error", "Algorithm failed")
-                return
-            cal = (A @ (raw - b).T).T
-
-            # 与 3D-View 完全一致的分段颜色
-            half = len(cal) // 2
-            level_cal = cal[:half]
-            tilt_cal  = cal[half:]
-
-            # 独立弹窗
-            dlg = QDialog(self.window)
-            dlg.setWindowTitle("Algorithm 3D View")
-            dlg.resize(800, 600)
-
-            fig = plt.figure(figsize=(8, 6))
-            ax  = fig.add_subplot(111, projection='3d')
-            ax.set_box_aspect([1, 1, 1])
-
-            # 与 3D-View 完全一致的配色
-            if len(level_cal):
-                ax.scatter(level_cal[:, 0], level_cal[:, 1], level_cal[:, 2],
-                           c='#ff0080', s=4, label='Level', depthshade=True)
-            if len(tilt_cal):
-                ax.scatter(tilt_cal[:, 0], tilt_cal[:, 1], tilt_cal[:, 2],
-                           c='#00e5ff', s=4, label='Tilt', depthshade=True)
-
-            draw_unit_sphere(ax, r=1.0)
-            ax.legend()
-            ax.set_title("Algorithm Calibrated 3D View")
-
-            canvas = FigureCanvas(fig)
-            lay = QVBoxLayout(dlg)
-            lay.addWidget(canvas)
-
-            # ✅ 添加旋转动画
-            from matplotlib.animation import FuncAnimation
-            anim = FuncAnimation(fig, lambda i: ax.view_init(20, i % 360),
-                                frames=360, interval=50, repeat=True)
-
-            dlg.exec_()
-
-        except Exception as e:
-            QMessageBox.critical(self.window, "Error", str(e))
-
+        self.window.set_status("3D Three-Step Done")
 
     def view_result_3d(self):
         if self.freeze_data is None:
             self.window.set_status("No frozen data. Run calibration first.")
             return
         xyz = np.array(self.freeze_data)
-        half = len(xyz) // 2
-        level_raw, tilt_raw = xyz[:half], xyz[half:]
+        half = len(xyz) // 3
+        level_raw, tilt_raw, stern_raw = xyz[:half], xyz[half:2*half], xyz[2*half:]
         pts_centered = xyz - self.freeze_b
         pts_cal = (self.freeze_A @ pts_centered.T).T
         norms = np.linalg.norm(pts_cal, axis=1, keepdims=True)
         pts_cal_unit = pts_cal / norms
-        level_cal, tilt_cal = pts_cal_unit[:half], pts_cal_unit[half:]
+        level_cal, tilt_cal, stern_cal = pts_cal_unit[:half], pts_cal_unit[half:2*half], pts_cal_unit[2*half:]
 
         self.ax3d.clear()
         if len(level_raw):
@@ -340,7 +293,10 @@ class CalibrationApp(QObject):
         if len(tilt_raw):
             self.ax3d.scatter(tilt_raw[:, 0], tilt_raw[:, 1], tilt_raw[:, 2],
                               c='#00e5ff', s=8, label='Tilt', depthshade=True)
-        self.ax3d.set_title("Raw Mag Data: Level vs Tilt")
+        if len(stern_raw):
+            self.ax3d.scatter(stern_raw[:, 0], stern_raw[:, 1], stern_raw[:, 2],
+                              c='#00ff80', s=8, label='Stern', depthshade=True)
+        self.ax3d.set_title("Raw Mag Data: Level / Tilt / Stern")
         self.ax3d.set_box_aspect([1, 1, 1])
         self.ax3d.legend()
 
@@ -352,6 +308,9 @@ class CalibrationApp(QObject):
         if len(tilt_cal):
             self.ax3d_cal.scatter(tilt_cal[:, 0], tilt_cal[:, 1], tilt_cal[:, 2],
                                   c='#00e5ff', s=4, label='Tilt (cal)', depthshade=True)
+        if len(stern_cal):
+            self.ax3d_cal.scatter(stern_cal[:, 0], stern_cal[:, 1], stern_cal[:, 2],
+                                  c='#00ff80', s=4, label='Stern (cal)', depthshade=True)
         self.ax3d_cal.set_title("Calibrated Mag on Sphere")
         self.ax3d_cal.set_box_aspect([1, 1, 1])
         self.ax3d_cal.legend()

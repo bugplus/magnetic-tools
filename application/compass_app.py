@@ -264,40 +264,60 @@ class CalibrationApp(QObject):
 
     @pyqtSlot()
     def on_algo3d(self):
-        """离线算法：CSV → 校准 → 独立 3D 视图"""
+        """CSV -> Calibrate -> 3D view (same color & interaction as 3D-View)"""
         fname, _ = QFileDialog.getOpenFileName(
-            self.window, "选择原始 CSV", "", "CSV (*.csv)")
+            self.window, "Select CSV", "", "CSV (*.csv)")
         if not fname:
             return
         try:
             raw = np.loadtxt(fname, delimiter=',', ndmin=2)
             if raw.shape[1] != 3:
-                raise ValueError("文件必须是 N×3")
+                raise ValueError("CSV must be N×3")
             b, A = fit_ellipsoid_3d(raw)
             if b is None or A is None:
-                QMessageBox.warning(self.window, "失败", "算法失败")
+                QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return
-            cal = (A @ (raw - b).T).T  # 校准结果
+            cal = (A @ (raw - b).T).T
 
-            # 立即弹出独立 3D 图
+            # 与 3D-View 完全一致的分段颜色
+            half = len(cal) // 2
+            level_cal = cal[:half]
+            tilt_cal  = cal[half:]
+
+            # 独立弹窗
             dlg = QDialog(self.window)
-            dlg.setWindowTitle("算法校准 3D 视图")
-            dlg.resize(700, 600)
+            dlg.setWindowTitle("Algorithm 3D View")
+            dlg.resize(800, 600)
 
-            fig = plt.figure(figsize=(7, 6))
-            ax = fig.add_subplot(111, projection='3d')
-            ax.scatter(cal[:, 0], cal[:, 1], cal[:, 2], c='r', s=4, label='Calibrated')
+            fig = plt.figure(figsize=(8, 6))
+            ax  = fig.add_subplot(111, projection='3d')
+            ax.set_box_aspect([1, 1, 1])
+
+            # 与 3D-View 完全一致的配色
+            if len(level_cal):
+                ax.scatter(level_cal[:, 0], level_cal[:, 1], level_cal[:, 2],
+                           c='#ff0080', s=4, label='Level', depthshade=True)
+            if len(tilt_cal):
+                ax.scatter(tilt_cal[:, 0], tilt_cal[:, 1], tilt_cal[:, 2],
+                           c='#00e5ff', s=4, label='Tilt', depthshade=True)
+
             draw_unit_sphere(ax, r=1.0)
             ax.legend()
-            ax.set_title("算法校准后 3D 视图")
+            ax.set_title("Algorithm Calibrated 3D View")
 
             canvas = FigureCanvas(fig)
             lay = QVBoxLayout(dlg)
             lay.addWidget(canvas)
+
+            # ✅ 添加旋转动画
+            from matplotlib.animation import FuncAnimation
+            anim = FuncAnimation(fig, lambda i: ax.view_init(20, i % 360),
+                                frames=360, interval=50, repeat=True)
+
             dlg.exec_()
 
         except Exception as e:
-            QMessageBox.critical(self.window, "错误", str(e))
+            QMessageBox.critical(self.window, "Error", str(e))
 
 
     def view_result_3d(self):

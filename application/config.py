@@ -4,6 +4,8 @@ CALIBRATION_DURATION = 30          # 每步采集时长（秒）
 MIN_3D_POINTS        = 100         # 每步最少点数
 ANGLE_GATE_DEG       = 2.0         # 角度变化门控阈值（度）
 DIST_GATE_CM         = 1.0         # 磁力空间稀疏阈值（厘米）
+UNIT_SPHERE_SCALE = 1.02
+DECIMAL_PRECISION = 8
 
 # ---------------- 坐标系 ----------------
 MAG_AXIS_MAP_A = [

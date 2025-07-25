@@ -81,6 +81,8 @@ class CompassMainWindow(QMainWindow):
         # 新增按钮
         self.algo3d_btn = QPushButton("Algorithm 3D View")
         btn_layout.addWidget(self.algo3d_btn)
+        self.reset_btn = QPushButton("Reset")
+        btn_layout.addWidget(self.reset_btn)
 
         # 3D buttons
         self.step0_btn = QPushButton("3D-Step1 Level")

@@ -161,10 +161,11 @@ class CalibrationApp(QObject):
         self.timer.start(200)
 
         # 按钮连接
-        self.window.step0_btn.clicked.connect(self.on_step0_clicked)
-        self.window.step1_btn.clicked.connect(self.start_step1)
-        self.window.step2_btn.clicked.connect(self.start_step2)
+        self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
+        self.window.step1_btn.clicked.connect(lambda: self.start_step(1))
+        self.window.step2_btn.clicked.connect(lambda: self.start_step(2))
         self.window.view3d_btn.clicked.connect(self.view_result_3d)
+        self.window.algo3d_btn.clicked.connect(self.on_algo3d)
 
     @pyqtSlot(float, float, float, float, float)
     def handle_new_data(self, mx, my, mz, pitch, roll):
@@ -195,40 +196,41 @@ class CalibrationApp(QObject):
             return
         self.window.step0_btn.setEnabled(False)
         self.start_step0(port, baud)
+    # ------- 唯一通用函数 -------
+    def start_step(self, step: int):
+        port = self.window.port_combo.currentText()
+        baud = int(self.window.baud_combo.currentText())
+        if "No" in port:
+            QMessageBox.warning(self.window, "Error", "No port")
+            return
 
-    def start_step0(self, port, baud):
-        self.mag3d_data.clear()
-        self.freeze_data = None
-        self.window.set_status("3D Step1: level 60s...")
+        need = {0: 0, 1: MIN_3D_POINTS, 2: int(MIN_3D_POINTS * 1.5)}[step]
+        if step and len(self.mag3d_data) < need:
+            self.window.set_status(f"Step{step} need ≥{need}")
+            return
+
+        if step == 0:
+            self.mag3d_data.clear()
+            self.freeze_data = None
+
+        btn_list = [self.window.step0_btn, self.window.step1_btn, self.window.step2_btn]
+        btn_list[step].setEnabled(False)
+
         self.thread = SerialThread(port, baud, self.data_bridge)
         self.thread.start()
         QTimer.singleShot(CALIBRATION_DURATION * 1000, self.thread.stop)
-        QTimer.singleShot(CALIBRATION_DURATION * 1000,
-                          lambda: self.window.step1_btn.setEnabled(True))
+        if step < 2:
+            QTimer.singleShot(CALIBRATION_DURATION * 1000,
+                            lambda: btn_list[step + 1].setEnabled(True))
+        else:
+            QTimer.singleShot(CALIBRATION_DURATION * 1000, self.finish_steps)
 
-    def start_step1(self):
-        if len(self.mag3d_data) < MIN_3D_POINTS:
-            self.window.set_status(f"Step1 need ≥{MIN_3D_POINTS}")
-            return
-        port = self.window.port_combo.currentText()
-        baud = int(self.window.baud_combo.currentText())
-        self.thread = SerialThread(port, baud, self.data_bridge)
-        self.thread.start()
-        self.window.set_status("3D Step2: nose-up 60s...")
-        QTimer.singleShot(CALIBRATION_DURATION * 1000, self.thread.stop)
-        QTimer.singleShot(CALIBRATION_DURATION * 1000,
-                          lambda: self.window.step2_btn.setEnabled(True))
+        labels = ["3D Step1: level 30s...",
+                "3D Step2: nose-up 30s...",
+                "3D Step3: stern-up 30s..."]
+        self.window.set_status(labels[step])
 
-    def start_step2(self):
-        if len(self.mag3d_data) < int(MIN_3D_POINTS * 1.5):
-            self.window.set_status(f"Step2 need ≥{int(MIN_3D_POINTS * 1.5)}")
-            return
-        port = self.window.port_combo.currentText()
-        baud = int(self.window.baud_combo.currentText())
-        self.thread = SerialThread(port, baud, self.data_bridge)
-        self.thread.start()
-        self.window.set_status("3D Step3: stern-up 60s...")
-        QTimer.singleShot(CALIBRATION_DURATION * 1000, self.finish_steps)
+    # 删除 start_step0/start_step1/start_step2
 
     def finish_steps(self):
         if self.thread:
@@ -273,6 +275,81 @@ class CalibrationApp(QObject):
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
 
+    @pyqtSlot()
+    def on_algo3d(self):
+        """
+        CSV → 3-D 椭球校准 → 单位球可视化
+        与 Calibrated 3D View 完全一致的处理流程
+        """
+        fname, _ = QFileDialog.getOpenFileName(
+            self.window, "Select CSV", "", "CSV (*.csv)")
+        if not fname:
+            return
+        try:
+            raw = np.loadtxt(fname, delimiter=',', ndmin=2)
+            if raw.shape[1] != 3:
+                raise ValueError("CSV must be N×3")
+
+            # ---------- 1. 椭球拟合 ----------
+            b, A = fit_ellipsoid_3d(raw)
+            if b is None or A is None:
+
+                QMessageBox.warning(self.window, "Error", "Algorithm failed")
+                return
+
+            # ---------- 2. 校准 ----------
+            pts_centered = raw - b
+            pts_cal = (A @ pts_centered.T).T
+            norms = np.linalg.norm(pts_cal, axis=1, keepdims=True)
+            pts_cal_unit = pts_cal / norms
+
+            # ---------- 3. 分段颜色 ----------
+            n = len(pts_cal_unit)
+            k = n // 3
+            level_cal = pts_cal_unit[:k]
+            tilt_cal  = pts_cal_unit[k:2*k]
+            stern_cal = pts_cal_unit[2*k:]
+
+            # ---------- 4. 弹窗 + 3D ----------
+            dlg = QDialog(self.window)
+            dlg.setWindowTitle("Algorithm 3D View")
+            dlg.resize(800, 600)
+
+            fig = plt.figure(figsize=(8, 6))
+            ax  = fig.add_subplot(111, projection='3d')
+            ax.set_box_aspect([1, 1, 1])
+
+            # 单位球
+            draw_unit_sphere(ax, r=1.0)
+
+            # 三段散点
+            if len(level_cal):
+                ax.scatter(*level_cal.T,
+                           c='#ff0080', s=4, label='Level', depthshade=True)
+            if len(tilt_cal):
+                ax.scatter(*tilt_cal.T,
+                           c='#00e5ff', s=4, label='Tilt', depthshade=True)
+            if len(stern_cal):
+                ax.scatter(*stern_cal.T,
+                           c='#00ff80', s=4, label='Stern', depthshade=True)
+
+            ax.legend()
+            ax.set_title("Algorithm Calibrated 3D View")
+
+            canvas = FigureCanvas(fig)
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(canvas)
+
+            # 旋转动画
+            from matplotlib.animation import FuncAnimation
+            _ = FuncAnimation(fig,
+                              lambda i: ax.view_init(20, i % 360),
+                              frames=360, interval=50, repeat=True)
+
+            dlg.exec_()
+
+        except Exception as e:
+            QMessageBox.critical(self.window, "Error", str(e))
     def view_result_3d(self):
         if self.freeze_data is None:
             self.window.set_status("No frozen data. Run calibration first.")

@@ -17,7 +17,11 @@ from PyQt5.QtCore import (
 )
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.colors import LightSource
-from config import CALIBRATION_DURATION, MIN_3D_POINTS
+from config import (
+    CALIBRATION_DURATION, MIN_3D_POINTS,
+    ANGLE_GATE_DEG, DIST_GATE_CM
+)
+
 
 # -----------------------------
 # 1. 线程安全串口读取（带角度门控+稀疏化）
@@ -34,26 +38,46 @@ class SerialThread(QThread):
         self.cache_mag = None
         self.cache_ang = None
 
+    # SerialThread.run()  三角度门控版
     def run(self):
         import numpy as np, re, serial
         try:
             with serial.Serial(self.port, self.baud, timeout=1) as ser:
+                last_ang = None     # [pitch, roll, yaw]
+                last_xyz = None     # [mx, my, mz]
+
                 while self.running:
                     line = ser.readline().decode(errors='ignore')
+
                     m = re.search(r'mag_x=\s*([-\d\.]+),\s*mag_y=\s*([-\d\.]+),\s*mag_z=\s*([-\d\.]+)', line)
                     if m:
                         self.cache_mag = list(map(float, m.groups()))
+
                     a = re.search(r'pitch=\s*([-\d\.]+).*roll=\s*([-\d\.]+).*yaw=\s*([-\d\.]+)', line)
                     if a:
                         self.cache_ang = list(map(float, a.groups()))
+
                     if self.cache_mag and self.cache_ang:
                         mx, my, mz = -self.cache_mag[1], -self.cache_mag[0], self.cache_mag[2]
-                        pitch, roll, _ = self.cache_ang
-                        self.bridge.new_data.emit(mx, my, mz, pitch, roll)
+                        pitch, roll, yaw = self.cache_ang
+                        xyz = np.array([mx, my, mz])
+                        ang = np.array([pitch, roll, yaw])
+
+                        # 1) 三角度门控：任一方向变化≥ANGLE_GATE_DEG 即有效
+                        if last_ang is None or np.any(np.abs(ang - last_ang) >= ANGLE_GATE_DEG):
+                            last_ang = ang
+                        else:
+                            self.cache_mag = self.cache_ang = None
+                            continue
+
+                        # 2) 磁力稀疏化
+                        if last_xyz is None or np.linalg.norm(xyz - last_xyz) >= DIST_GATE_CM * 0.01:
+                            last_xyz = xyz
+                            self.bridge.new_data.emit(mx, my, mz, pitch, roll)
+
                         self.cache_mag = self.cache_ang = None
         except Exception as e:
             print("Serial error:", e)
-
     def stop(self):
         self.running = False
 

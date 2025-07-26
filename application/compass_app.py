@@ -289,16 +289,22 @@ class CalibrationApp(QObject):
         self.canvas3d.draw()
 
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
-
-        self.ax3d_cal.clear()
-        draw_unit_sphere(self.ax3d_cal, r=1.0)
-        self.ax3d_cal.scatter(
-            pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
-            c=np.linalg.norm(pts_cal_unit, axis=1),
-            s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
-        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
-        self.ax3d_cal.set_box_aspect([1, 1, 1])
-        self.canvas3d_cal.draw()
+        # 添加校准后数据保存功能
+        cal_csv_path, _ = QFileDialog.getSaveFileName(
+            self.window, "Save calibrated CSV", "calibrated_mag.csv", "CSV (*.csv)")
+        if cal_csv_path:
+            np.savetxt(cal_csv_path, pts_cal_unit, delimiter=',', fmt='%.8f')
+            self.window.set_status(f"Calibrated data saved to {cal_csv_path}")
+            
+            self.ax3d_cal.clear()
+            draw_unit_sphere(self.ax3d_cal, r=1.0)
+            self.ax3d_cal.scatter(
+                pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
+                c=np.linalg.norm(pts_cal_unit, axis=1),
+                s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
+            self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+            self.ax3d_cal.set_box_aspect([1, 1, 1])
+            self.canvas3d_cal.draw()
 
         c_code = generate_c_code_3d(self.freeze_b, self.freeze_A)
         csv_path, _ = QFileDialog.getSaveFileName(

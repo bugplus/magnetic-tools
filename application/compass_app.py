@@ -155,38 +155,51 @@ class CalibrationApp(QObject):
         self.app = QApplication(sys.argv)
         self.window = CompassMainWindow()
 
-        # 实时 3D
+        # ---------- 3D 画布 ----------
+        # 1. Raw 3D Mag（最上方）
         self.fig3d = plt.figure()
         self.canvas3d = FigureCanvas(self.fig3d)
         self.ax3d = self.fig3d.add_subplot(111, projection='3d')
-        self.ax3d.set_title("3D Real-time Mag")
-        self.canvas3d.setParent(self.window.central)
+        self.ax3d.set_title("Raw 3D Mag (μT)")
         self.window.central_layout.addWidget(self.canvas3d)
 
+        # 2. Raw Unit Sphere（左下）
+        self.fig_raw_sphere = plt.figure()
+        self.canvas_raw_sphere = FigureCanvas(self.fig_raw_sphere)
+        self.ax_raw_sphere = self.fig_raw_sphere.add_subplot(111, projection='3d')
+        self.ax_raw_sphere.set_title("Raw Unit Sphere")
+
+        # 3. Calibrated 3D Mag（右下）
         self.fig3d_cal = plt.figure()
         self.canvas3d_cal = FigureCanvas(self.fig3d_cal)
         self.ax3d_cal = self.fig3d_cal.add_subplot(111, projection='3d')
-        self.ax3d_cal.set_title("Calibrated 3D Mag")
-        self.window.central_layout.addWidget(self.canvas3d_cal)
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
 
-        # 数据桥
+        # 水平布局：左 Raw Sphere，右 Calibrated
+        from PyQt5.QtWidgets import QHBoxLayout
+        hbox = QHBoxLayout()
+        hbox.addWidget(self.canvas_raw_sphere)
+        hbox.addWidget(self.canvas3d_cal)
+        self.window.central_layout.addLayout(hbox)
+
+        # ---------- 数据桥 & 定时器 ----------
         self.data_bridge = DataBridge()
         self.data_bridge.new_data[float, float, float, float, float].connect(
             self.handle_new_data, Qt.QueuedConnection)
-
         self.mag3d_data = []
-        self.freeze_data = self.freeze_b = self.freeze_A = None
+        self.freeze_data = None
+        self.freeze_b = None
+        self.freeze_A = None
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_3d_plot_safe)
         self.timer.start(200)
 
-        # 按钮连接
+        # ---------- 按钮信号 ----------
         self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
         self.window.step1_btn.clicked.connect(lambda: self.start_step(1))
         self.window.step2_btn.clicked.connect(lambda: self.start_step(2))
         self.window.view3d_btn.clicked.connect(self.view_result_3d)
         self.window.algo3d_btn.clicked.connect(self.on_algo3d)
-        # 7. 支持“不关程序继续下一轮校准”
         self.window.reset_btn.clicked.connect(self.reset_calibration)
 
     @pyqtSlot(float, float, float, float, float)
@@ -292,60 +305,73 @@ class CalibrationApp(QObject):
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
     def view_result_3d(self):
-        """
-        显示原始与校准后的 3D 视图，并带旋转动画
-        """
         if self.freeze_data is None:
-            self.window.set_status("No frozen data. Run calibration first.")
             return
+
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+        from PyQt5.QtWidgets import QHBoxLayout
+
         xyz = np.array(self.freeze_data)
-        half = len(xyz) // 3
-        level_raw, tilt_raw, stern_raw = xyz[:half], xyz[half:2*half], xyz[2*half:]
+        n = len(xyz)
+        k = n // 3
+
+        # 分段颜色
+        colors = ['#ff0080', '#00e5ff', '#8000FF']
+        labels = ['Level', 'Tilt', 'Stern']
+
+        # 原图（最上面）
+        self.ax3d.clear()
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = xyz[i * k : (i + 1) * k]
+            if len(seg):
+                self.ax3d.scatter(*seg.T, c=c, s=8, label=lab, depthshade=False)
+        self.ax3d.set_title("Raw 3D Mag (μT)")
+        self.ax3d.legend()
+        self.ax3d.set_box_aspect([1, 1, 1])
+        self.canvas3d.draw()
+
+        # 单位球坐标
+        raw_unit = xyz / np.linalg.norm(xyz, axis=1, keepdims=True)
         pts_centered = xyz - self.freeze_b
         pts_cal = (self.freeze_A @ pts_centered.T).T
-        norms = np.linalg.norm(pts_cal, axis=1, keepdims=True)
-        pts_cal_unit = (pts_cal / norms) * UNIT_SPHERE_SCALE
-        level_cal, tilt_cal, stern_cal = pts_cal_unit[:half], pts_cal_unit[half:2*half], pts_cal_unit[2*half:]
+        pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
 
-        # 原始数据
-        self.ax3d.clear()
-        if len(level_raw):
-            self.ax3d.scatter(level_raw[:, 0], level_raw[:, 1], level_raw[:, 2],
-                              c='#ff0080', s=8, label='Level', depthshade=False)
-        if len(tilt_raw):
-            self.ax3d.scatter(tilt_raw[:, 0], tilt_raw[:, 1], tilt_raw[:, 2],
-                              c='#00e5ff', s=8, label='Tilt', depthshade=False)
-        if len(stern_raw):
-            self.ax3d.scatter(stern_raw[:, 0], stern_raw[:, 1], stern_raw[:, 2],
-                              c='#8000FF', s=8, label='Stern', depthshade=False)
-        self.ax3d.set_title("Raw Mag Data: Level / Tilt / Stern")
-        self.ax3d.set_box_aspect([1, 1, 1])
-        self.ax3d.legend()
+        # 原单位球（左）
+        self.ax_raw_sphere.clear()
+        draw_unit_sphere(self.ax_raw_sphere, r=1.0)
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = raw_unit[i * k : (i + 1) * k]
+            if len(seg):
+                self.ax_raw_sphere.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+        self.ax_raw_sphere.set_title("Raw Unit Sphere")
+        self.ax_raw_sphere.set_xlim([-1, 1])
+        self.ax_raw_sphere.set_ylim([-1, 1])
+        self.ax_raw_sphere.set_zlim([-1, 1])
+        self.ax_raw_sphere.set_box_aspect([1, 1, 1])
+        self.ax_raw_sphere.legend()
+        self.canvas_raw_sphere.draw()
 
-        # 校准后数据
+        # 校准单位球（右）
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
-        if len(level_cal):
-            self.ax3d_cal.scatter(level_cal[:, 0], level_cal[:, 1], level_cal[:, 2],
-                                  c='#ff0080', s=4, label='Level (cal)', depthshade=False)
-        if len(tilt_cal):
-            self.ax3d_cal.scatter(tilt_cal[:, 0], tilt_cal[:, 1], tilt_cal[:, 2],
-                                  c='#00e5ff', s=4, label='Tilt (cal)', depthshade=False)
-        if len(stern_cal):
-            self.ax3d_cal.scatter(stern_cal[:, 0], stern_cal[:, 1], stern_cal[:, 2],
-                                  c='#8000FF', s=4, label='Stern (cal)', depthshade=False)
-        self.ax3d_cal.set_title("Calibrated Mag on Sphere")
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = pts_cal_unit[i * k : (i + 1) * k]
+            if len(seg):
+                self.ax3d_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+        self.ax3d_cal.set_xlim([-1, 1])
+        self.ax3d_cal.set_ylim([-1, 1])
+        self.ax3d_cal.set_zlim([-1, 1])
         self.ax3d_cal.set_box_aspect([1, 1, 1])
         self.ax3d_cal.legend()
-
-        # 5. 动画引用防崩溃
-        from matplotlib.animation import FuncAnimation
-        self.anim  = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(20, i % 360),
-                                   frames=360, interval=50, repeat=True)
-        self.anim2 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(20, i % 360),
-                                   frames=360, interval=50, repeat=True)
-        self.canvas3d.draw()
         self.canvas3d_cal.draw()
+
+        # 动画
+        elev = 20
+        self.anim1 = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(elev, i % 360), frames=360, interval=50)
+        self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
+        self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
 
     @pyqtSlot()
     def on_algo3d(self):

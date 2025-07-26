@@ -136,6 +136,13 @@ def generate_c_code_3d(b, A):
     ]
     return "\n".join(lines)
 
+
+def ellipsoid_to_sphere(raw_xyz, b, A):
+    """一键：原始磁向量 → 单位球向量"""
+    centered = raw_xyz - b
+    sphere   = (A @ centered.T).T
+    return sphere / np.linalg.norm(sphere, axis=1, keepdims=True)
+
 def draw_unit_sphere(ax, r=1.0):
     u = np.linspace(0, 2 * np.pi, 60)
     v = np.linspace(0, np.pi, 30)
@@ -281,10 +288,8 @@ class CalibrationApp(QObject):
         self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
         self.canvas3d.draw()
 
-        pts_centered = xyz - self.freeze_b
-        pts_cal = (self.freeze_A @ pts_centered.T).T
-        scale = np.linalg.norm(pts_cal, axis=1).mean()
-        pts_cal_unit = (pts_cal / scale) * UNIT_SPHERE_SCALE  # 3. 魔法数字→config
+        pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
+
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
         self.ax3d_cal.scatter(
@@ -393,10 +398,7 @@ class CalibrationApp(QObject):
                 return
 
             # 2. 校准
-            pts_centered = raw - b
-            pts_cal = (A @ pts_centered.T).T
-            norms = np.linalg.norm(pts_cal, axis=1, keepdims=True)
-            pts_cal_unit = (pts_cal / norms) * UNIT_SPHERE_SCALE
+            pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
 
             # 3. 分段颜色
             n = len(pts_cal_unit)

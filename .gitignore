@@ -2,10 +2,16 @@
 /shelf/
 /workspace.xml
 
+# 先忽略 application 目录下的所有内容
 application/**/*
-!application/calibration_mag/*.py
-!application/calibration_mag/*.c
-!application/calibration_mag/*.h
+
+# 然后单独取消忽略 calibration_mag 文件夹下的特定文件类型
+!application/calibration_mag/
+!application/calibration_mag/**/*.py
+!application/calibration_mag/**/*.c
+!application/calibration_mag/**/*.h
+
+# 最后处理其他目录下的特定文件类型
 !application/**/*.py
 !application/**/*.c
 !application/**/*.h

@@ -22,6 +22,10 @@ from config import (
     ANGLE_GATE_DEG, DIST_GATE_CM,
     UNIT_SPHERE_SCALE, DECIMAL_PRECISION
 )
+# 1. 在 compass_app.py 的 import 区末尾追加
+import os
+CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
+os.makedirs(CALIB_DIR, exist_ok=True)
 
 # -----------------------------
 # 1. 线程安全串口读取（角度门控+稀疏化）
@@ -270,48 +274,64 @@ class CalibrationApp(QObject):
         self.window.view3d_btn.setEnabled(False)
         self.window.set_status("Reset complete. Start new calibration.")
 
+    # 8. 校准完成处理
     def finish_steps(self):
         if self.thread:
             self.thread.stop()
         if len(self.mag3d_data) < MIN_3D_POINTS * 2:
             self.window.set_status(f"3D Need ≥{MIN_3D_POINTS * 2}")
             return
+
         self.freeze_data = list(self.mag3d_data)
         self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
         if self.freeze_b is None or self.freeze_A is None:
             self.window.set_status("3D Calibration failed")
             return
+
         self.timer.stop()
+
+        # 1. 更新 Raw 3D 图
         xyz = np.array(self.freeze_data)
         self.ax3d.clear()
         self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
         self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
         self.canvas3d.draw()
 
+        # 2. 计算校准后的单位球数据
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
-        # 添加校准后数据保存功能
-        cal_csv_path, _ = QFileDialog.getSaveFileName(
-            self.window, "Save calibrated CSV", "calibrated_mag.csv", "CSV (*.csv)")
-        if cal_csv_path:
-            np.savetxt(cal_csv_path, pts_cal_unit, delimiter=',', fmt='%.8f')
-            self.window.set_status(f"Calibrated data saved to {cal_csv_path}")
-            
-            self.ax3d_cal.clear()
-            draw_unit_sphere(self.ax3d_cal, r=1.0)
-            self.ax3d_cal.scatter(
-                pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
-                c=np.linalg.norm(pts_cal_unit, axis=1),
-                s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
-            self.ax3d_cal.set_title("Calibrated on Unit Sphere")
-            self.ax3d_cal.set_box_aspect([1, 1, 1])
-            self.canvas3d_cal.draw()
 
+        # 3. 统一文件夹
+        import os
+        CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
+        os.makedirs(CALIB_DIR, exist_ok=True)
+
+        # 4. 保存 calibrated_mag.csv
+        cal_csv_path = os.path.join(CALIB_DIR, "calibrated_mag.csv")
+        np.savetxt(cal_csv_path, pts_cal_unit, delimiter=',', fmt='%.8f')
+        self.window.set_status(f"Calibrated data saved to {cal_csv_path}")
+
+        # 5. 保存 raw_mag.csv
+        raw_csv_path = os.path.join(CALIB_DIR, "raw_mag.csv")
+        np.savetxt(raw_csv_path, xyz, delimiter=',', fmt='%.6f')
+
+        # 6. 保存 mag_calibration.h
         c_code = generate_c_code_3d(self.freeze_b, self.freeze_A)
-        csv_path, _ = QFileDialog.getSaveFileName(
-            self.window, "Save raw CSV", "raw_mag.csv", "CSV (*.csv)")
-        if csv_path:
-            np.savetxt(csv_path, np.array(self.freeze_data),
-                       delimiter=',', fmt='%.6f')
+        c_path = os.path.join(CALIB_DIR, "mag_calibration.h")
+        with open(c_path, 'w', encoding='utf-8') as f:
+            f.write(c_code)
+
+        # 7. 更新校准球图
+        self.ax3d_cal.clear()
+        draw_unit_sphere(self.ax3d_cal, r=1.0)
+        self.ax3d_cal.scatter(
+            pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
+            c=np.linalg.norm(pts_cal_unit, axis=1),
+            s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+        self.ax3d_cal.set_box_aspect([1, 1, 1])
+        self.canvas3d_cal.draw()
+
+        # 8. 弹窗显示代码
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")

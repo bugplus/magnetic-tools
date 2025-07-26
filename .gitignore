@@ -3,6 +3,9 @@
 /workspace.xml
 
 application/**/*
+!application/calibration_mag/*.py
+!application/calibration_mag/*.c
+!application/calibration_mag/*.h
 !application/**/*.py
 !application/**/*.c
 !application/**/*.h

@@ -140,6 +140,16 @@ def generate_c_code_3d(b, A):
     ]
     return "\n".join(lines)
 
+def raw_to_unit(raw_xyz, b):
+    """
+    仅去掉硬铁偏移，不做软铁变换。
+    用于 Raw Unit Sphere 可视化，使其中心落在原点。
+    """
+    centered = raw_xyz - b
+    length = np.linalg.norm(centered, axis=1, keepdims=True)
+    # 防 0 除
+    length[length == 0] = 1
+    return centered / length
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     """一键：原始磁向量 → 单位球向量"""
@@ -335,23 +345,22 @@ class CalibrationApp(QObject):
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
+
     def view_result_3d(self):
         if self.freeze_data is None:
             return
 
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
-        from PyQt5.QtWidgets import QHBoxLayout
 
         xyz = np.array(self.freeze_data)
         n = len(xyz)
         k = n // 3
 
-        # 分段颜色
         colors = ['#ff0080', '#00e5ff', '#8000FF']
         labels = ['Level', 'Tilt', 'Stern']
 
-        # 原图（最上面）
+        # 1. Raw 3D Mag（最上方）——保持不变
         self.ax3d.clear()
         for i, (c, lab) in enumerate(zip(colors, labels)):
             seg = xyz[i * k : (i + 1) * k]
@@ -362,13 +371,8 @@ class CalibrationApp(QObject):
         self.ax3d.set_box_aspect([1, 1, 1])
         self.canvas3d.draw()
 
-        # 单位球坐标
-        raw_unit = xyz / np.linalg.norm(xyz, axis=1, keepdims=True)
-        pts_centered = xyz - self.freeze_b
-        pts_cal = (self.freeze_A @ pts_centered.T).T
-        pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
-
-        # 原单位球（左）
+        # 2. Raw Unit Sphere（左下）——先减硬铁再归一化
+        raw_unit = raw_to_unit(xyz, self.freeze_b)
         self.ax_raw_sphere.clear()
         draw_unit_sphere(self.ax_raw_sphere, r=1.0)
         for i, (c, lab) in enumerate(zip(colors, labels)):
@@ -383,7 +387,11 @@ class CalibrationApp(QObject):
         self.ax_raw_sphere.legend()
         self.canvas_raw_sphere.draw()
 
-        # 校准单位球（右）
+        # 3. Calibrated Unit Sphere（右下）——保持完整软/硬铁变换
+        pts_centered = xyz - self.freeze_b
+        pts_cal = (self.freeze_A @ pts_centered.T).T
+        pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
+
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
         for i, (c, lab) in enumerate(zip(colors, labels)):
@@ -403,11 +411,10 @@ class CalibrationApp(QObject):
         self.anim1 = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(elev, i % 360), frames=360, interval=50)
         self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
         self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
-
     @pyqtSlot()
     def on_algo3d(self):
         """
-        CSV → 3-D 椭球校准 → 单位球可视化（与 Calibrated 3D View 完全一致）
+        CSV → 3-D 椭球校准 → 单位球可视化（Raw 先减硬铁，再归一化）
         """
         fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
         if not fname:
@@ -423,48 +430,54 @@ class CalibrationApp(QObject):
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return
 
-            # 2. 校准
+            # 2. 仅去硬铁 -> 单位球（用于 Raw Unit Sphere 效果）
+            pts_raw_unit = raw_to_unit(raw, b)
+
+            # 3. 完整校准（软铁+硬铁）
             pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
 
-            # 3. 分段颜色
-            n = len(pts_cal_unit)
+            # 4. 分段颜色
+            n = len(pts_raw_unit)          # 两段都用同一分段
             k = n // 3
-            level_cal = pts_cal_unit[:k]
-            tilt_cal  = pts_cal_unit[k:2*k]
-            stern_cal = pts_cal_unit[2*k:]
+            colors = ['#ff0080', '#00e5ff', '#8000FF']
+            sections = ['Level', 'Tilt', 'Stern']
 
-            # 4. 弹窗 + 3D
+            # 5. 弹窗 + 3D
             dlg = QDialog(self.window)
             dlg.setWindowTitle("Algorithm 3D View")
-            dlg.resize(800, 600)
+            dlg.resize(900, 600)
 
-            fig = plt.figure(figsize=(8, 6))
-            ax  = fig.add_subplot(111, projection='3d')
-            ax.set_box_aspect([1, 1, 1])
+            fig = plt.figure(figsize=(9, 6))
+            # 左：仅去硬铁
+            ax_raw = fig.add_subplot(121, projection='3d')
+            ax_raw.set_title("Raw Unit Sphere (Hard-Iron Only)")
+            ax_raw.set_box_aspect([1, 1, 1])
+            draw_unit_sphere(ax_raw, r=1.0)
+            for i, (c, lab) in enumerate(zip(colors, sections)):
+                seg = pts_raw_unit[i*k:(i+1)*k]
+                if len(seg):
+                    ax_raw.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+            ax_raw.legend()
 
-            # 单位球
-            draw_unit_sphere(ax, r=1.0)
-
-            # 三段散点
-            if len(level_cal):
-                ax.scatter(*level_cal.T, c='#ff0080', s=4, label='Level', depthshade=False)
-            if len(tilt_cal):
-                ax.scatter(*tilt_cal.T, c='#00e5ff', s=4, label='Tilt', depthshade=False)
-            if len(stern_cal):
-                ax.scatter(*stern_cal.T, c='#8000FF', s=4, label='Stern', depthshade=False)
-
-            ax.legend()
-            ax.set_title("Algorithm Calibrated 3D View")
+            # 右：完整校准
+            ax_cal = fig.add_subplot(122, projection='3d')
+            ax_cal.set_title("Calibrated Unit Sphere")
+            ax_cal.set_box_aspect([1, 1, 1])
+            draw_unit_sphere(ax_cal, r=1.0)
+            for i, (c, lab) in enumerate(zip(colors, sections)):
+                seg = pts_cal_unit[i*k:(i+1)*k]
+                if len(seg):
+                    ax_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+            ax_cal.legend()
 
             canvas = FigureCanvas(fig)
             lay = QVBoxLayout(dlg)
             lay.addWidget(canvas)
 
-            # 动画引用防崩溃
+            # 动画
             from matplotlib.animation import FuncAnimation
-            dlg.anim = FuncAnimation(fig,
-                                     lambda i: ax.view_init(20, i % 360),
-                                     frames=360, interval=50, repeat=True)
+            dlg.anim1 = FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
+            dlg.anim2 = FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
             dlg.exec_()
 
         except Exception as e:

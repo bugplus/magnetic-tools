@@ -31,7 +31,7 @@ os.makedirs(CALIB_DIR, exist_ok=True)
 # 1. 线程安全串口读取（角度门控+稀疏化）
 # -----------------------------
 class DataBridge(QObject):
-    new_data = pyqtSignal(float, float, float, float, float)
+    new_data = pyqtSignal(float, float, float, float, float, float)
 
 class SerialThread(QThread):
     def __init__(self, port, baud, bridge):
@@ -77,7 +77,7 @@ class SerialThread(QThread):
                         # 磁力稀疏化
                         if last_xyz is None or np.linalg.norm(xyz - last_xyz) >= DIST_GATE_CM * 0.01:
                             last_xyz = xyz
-                            self.bridge.new_data.emit(mx, my, mz, pitch, roll)
+                            self.bridge.new_data.emit(mx, my, mz, pitch, roll, yaw)
 
                         self.cache_mag = self.cache_ang = None
         except Exception as e:
@@ -90,7 +90,15 @@ class SerialThread(QThread):
 # 2. 核心函数：椭球拟合 + C 代码生成
 # -----------------------------
 def fit_ellipsoid_3d(points):
+    # 修改函数以处理带标签的数据
     pts = np.asarray(points, dtype=float)
+    if pts.ndim == 2 and pts.shape[1] == 6:
+        # 如果是带标签的数据，只使用前3列（mx, my, mz）
+        pts = pts[:, :3]
+    elif pts.ndim == 2 and pts.shape[1] != 3:
+        print("点数据格式错误")
+        return None, None
+        
     if pts.shape[0] < 10:
         print("点数不足 10")
         return None, None
@@ -150,6 +158,12 @@ def raw_to_unit(raw_xyz, b):
     仅去掉硬铁偏移，不做软铁变换。
     用于 Raw Unit Sphere 可视化，使其中心落在原点。
     """
+    # 处理带标签的数据
+    if raw_xyz.ndim == 2 and raw_xyz.shape[1] == 6:
+        raw_xyz = raw_xyz[:, :3]
+    elif raw_xyz.ndim == 2 and raw_xyz.shape[1] != 3:
+        raise ValueError("数据格式错误")
+        
     centered = raw_xyz - b
     length = np.linalg.norm(centered, axis=1, keepdims=True)
     # 防 0 除
@@ -158,6 +172,12 @@ def raw_to_unit(raw_xyz, b):
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     """一键：原始磁向量 → 单位球向量"""
+    # 处理带标签的数据
+    if raw_xyz.ndim == 2 and raw_xyz.shape[1] == 6:
+        raw_xyz = raw_xyz[:, :3]
+    elif raw_xyz.ndim == 2 and raw_xyz.shape[1] != 3:
+        raise ValueError("数据格式错误")
+        
     # 硬铁校正
     centered = raw_xyz - b
     # 软铁校正 - 修正矩阵变换方向
@@ -176,6 +196,14 @@ def draw_unit_sphere(ax, r=1.0):
     ls = LightSource(azdeg=45, altdeg=45)
     rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
     ax.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
+
+def calculate_heading(mx, my):
+    """计算航向角"""
+    heading = np.arctan2(my, mx)
+    # 转换为度数并归一化到0-360
+    heading_deg = np.degrees(heading)
+    heading_deg = (heading_deg + 360) % 360
+    return heading_deg
 
 # -----------------------------
 # 3. CalibrationApp
@@ -215,7 +243,7 @@ class CalibrationApp(QObject):
 
         # ---------- 数据桥 & 定时器 ----------
         self.data_bridge = DataBridge()
-        self.data_bridge.new_data[float, float, float, float, float].connect(
+        self.data_bridge.new_data[float, float, float, float, float, float].connect(
             self.handle_new_data, Qt.QueuedConnection)
         self.mag3d_data = []
         self.freeze_data = None
@@ -233,10 +261,11 @@ class CalibrationApp(QObject):
         self.window.algo3d_btn.clicked.connect(self.on_algo3d)
         self.window.reset_btn.clicked.connect(self.reset_calibration)
 
-    @pyqtSlot(float, float, float, float, float)
-    def handle_new_data(self, mx, my, mz, pitch, roll):
+    @pyqtSlot(float, float, float, float, float, float)
+    def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
         if self.freeze_data is None:
-            self.mag3d_data.append([mx, my, mz])
+            # 添加带标签的磁力数据 [mx, my, mz, pitch, roll, yaw]
+            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw])
 
     def _update_3d_plot_safe(self):
         if self.freeze_data is not None:
@@ -247,7 +276,8 @@ class CalibrationApp(QObject):
     def _update_3d_plot(self):
         try:
             self.ax3d.clear()
-            xyz = np.array(self.mag3d_data)
+            # 只使用前3个元素（mx, my, mz）绘制3D图
+            xyz = np.array(self.mag3d_data)[:, :3] if self.mag3d_data else np.empty((0, 3))
             self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
             self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
             self.canvas3d.draw()
@@ -311,7 +341,7 @@ class CalibrationApp(QObject):
         self.timer.stop()
 
         # 1. 更新 Raw 3D 图
-        xyz = np.array(self.freeze_data)
+        xyz = np.array(self.freeze_data)[:, :3]  # 只取磁力数据部分
         self.ax3d.clear()
         self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
         self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
@@ -330,9 +360,9 @@ class CalibrationApp(QObject):
         np.savetxt(cal_csv_path, pts_cal_unit, delimiter=',', fmt='%.8f')
         self.window.set_status(f"Calibrated data saved to {cal_csv_path}")
 
-        # 5. 保存 raw_mag.csv
-        raw_csv_path = os.path.join(CALIB_DIR, "raw_mag.csv")
-        np.savetxt(raw_csv_path, xyz, delimiter=',', fmt='%.6f')
+        # 5. 保存 raw_mag.csv (包含欧拉角标签)
+        raw_csv_path = os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv")
+        np.savetxt(raw_csv_path, np.array(self.freeze_data), delimiter=',', fmt='%.6f')
 
         # 6. 保存 mag_calibration.h
         c_code = generate_c_code_3d(self.freeze_b, self.freeze_A)
@@ -363,7 +393,8 @@ class CalibrationApp(QObject):
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
 
-        xyz = np.array(self.freeze_data)
+        # 只取磁力数据部分
+        xyz = np.array(self.freeze_data)[:, :3]
         n = len(xyz)
         k = n // 3
 
@@ -431,8 +462,8 @@ class CalibrationApp(QObject):
             return
         try:
             raw = np.loadtxt(fname, delimiter=',', ndmin=2)
-            if raw.shape[1] != 3:
-                raise ValueError("CSV must be N×3")
+            if raw.shape[1] != 3 and raw.shape[1] != 6:
+                raise ValueError("CSV must be N×3 or N×6")
 
             # 1. 椭球拟合
             b, A = fit_ellipsoid_3d(raw)

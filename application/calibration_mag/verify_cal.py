@@ -24,16 +24,22 @@ def fit_ellipsoid_3d(points):
     eig_vals = np.maximum(eig_vals, 1e-6)
     b = -np.linalg.solve(Q, [G, H, I]) / 2
     scale = np.sqrt(1.0 / eig_vals)
+    # 更稳定和正确的计算方式
     A = np.linalg.inv(eig_vecs @ np.diag(scale) @ eig_vecs.T)
-    # 强制行列式为正
+    # 确保行列式为正（物理意义）
     if np.linalg.det(A) < 0:
         A = -A
     return b, A
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
+    # 硬铁校正
     centered = raw_xyz - b
-    sphere = (A @ centered.T).T
-    return sphere / np.linalg.norm(sphere, axis=1, keepdims=True)
+    # 软铁校正 - 修正矩阵变换方向
+    sphere = centered @ A  # 而不是 (A @ centered.T).T
+    # 归一化
+    norm = np.linalg.norm(sphere, axis=1, keepdims=True)
+    norm[norm == 0] = 1  # 防止除零错误
+    return sphere / norm
 
 # ---------------------------------------
 # 2. 验证

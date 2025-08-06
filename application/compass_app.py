@@ -120,14 +120,20 @@ def fit_ellipsoid_3d(points):
 
     b = -np.linalg.solve(Q, [G, H, I]) / 2
     scale = np.sqrt(1.0 / eig_vals)
-    A_cal = eig_vecs @ np.diag(scale) @ eig_vecs.T
-    A_cal = np.linalg.inv(A_cal)
+    # 更稳定和正确的计算方式
+    A_cal = np.linalg.inv(eig_vecs @ np.diag(scale) @ eig_vecs.T)
+    # 确保行列式为正（物理意义）
+    if np.linalg.det(A_cal) < 0:
+        A_cal = -A_cal
     return b, A_cal
 
 def generate_c_code_3d(b, A):
     if b is None or A is None:
         return "/* Error: Calibration failed */"
     bx, by, bz = b
+    # 确保软铁矩阵具有正的行列式（物理意义）
+    if np.linalg.det(A) < 0:
+        A = -A
     # 4. 小数精度 6 → 8
     lines = [
         "/* 3D mag calibration (auto) */",
@@ -139,7 +145,6 @@ def generate_c_code_3d(b, A):
         "};"
     ]
     return "\n".join(lines)
-
 def raw_to_unit(raw_xyz, b):
     """
     仅去掉硬铁偏移，不做软铁变换。
@@ -153,9 +158,14 @@ def raw_to_unit(raw_xyz, b):
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     """一键：原始磁向量 → 单位球向量"""
+    # 硬铁校正
     centered = raw_xyz - b
-    sphere   = (A @ centered.T).T
-    return sphere / np.linalg.norm(sphere, axis=1, keepdims=True)
+    # 软铁校正 - 修正矩阵变换方向
+    sphere = centered @ A  # 而不是 (A @ centered.T).T
+    # 归一化
+    norm = np.linalg.norm(sphere, axis=1, keepdims=True)
+    norm[norm == 0] = 1  # 防止除零错误
+    return sphere / norm
 
 def draw_unit_sphere(ax, r=1.0):
     u = np.linspace(0, 2 * np.pi, 60)

@@ -16,6 +16,12 @@ from mpl_toolkits.mplot3d import Axes3D
 def fit_ellipsoid_3d(points):
     """Ellipsoid fitting algorithm (same as compass_app.py)"""
     pts = np.asarray(points, dtype=float)
+    # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns
+    if pts.ndim == 2 and pts.shape[1] == 6:
+        pts = pts[:, :3]
+    elif pts.ndim == 2 and pts.shape[1] != 3:
+        raise ValueError("Data must be in N×3 or N×6 format")
+        
     if pts.shape[0] < 10:
         raise ValueError("Insufficient points (min 10 required)")
 
@@ -52,6 +58,12 @@ def fit_ellipsoid_3d(points):
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     """Raw magnetic vector → unit sphere vector (same as app algorithm)"""
+    # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns
+    if raw_xyz.ndim == 2 and raw_xyz.shape[1] == 6:
+        raw_xyz = raw_xyz[:, :3]
+    elif raw_xyz.ndim == 2 and raw_xyz.shape[1] != 3:
+        raise ValueError("Data must be in N×3 or N×6 format")
+        
     centered = raw_xyz - b
     sphere = (A @ centered.T).T
     return sphere / np.linalg.norm(sphere, axis=1, keepdims=True)
@@ -59,17 +71,22 @@ def ellipsoid_to_sphere(raw_xyz, b, A):
 def verify_raw_data(csv_path):
     """Validate raw data quality"""
     raw = np.loadtxt(csv_path, delimiter=',', ndmin=2)
-    if raw.ndim != 2 or raw.shape[1] != 3:
-        raise ValueError("CSV must be in N×3 format")
+    # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns
+    if raw.ndim == 2 and raw.shape[1] == 6:
+        mag_data = raw[:, :3]
+    elif raw.ndim == 2 and raw.shape[1] == 3:
+        mag_data = raw
+    else:
+        raise ValueError("CSV must be in N×3 or N×6 format")
     
-    n = len(raw)
+    n = len(mag_data)
     print(f"\n=== Raw Data Validation [File: {os.path.basename(csv_path)}] ===")
     print(f"Data points: {n}")
     
     # Basic statistics
-    norms = np.linalg.norm(raw, axis=1)
+    norms = np.linalg.norm(mag_data, axis=1)
     print(f"Norm range: {np.min(norms):.2f} - {np.max(norms):.2f}")
-    print(f"Mean: {np.mean(raw, axis=0)}")
+    print(f"Mean: {np.mean(mag_data, axis=0)}")
     
     # Ellipsoid fitting quality
     try:
@@ -115,6 +132,12 @@ def verify_calibrated_data(csv_path):
 
 def plot_3d_data(data, title, filename, is_calibrated=False):
     """Generate 3D data visualization"""
+    # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns
+    if data.ndim == 2 and data.shape[1] == 6:
+        data = data[:, :3]
+    elif data.ndim == 2 and data.shape[1] != 3:
+        raise ValueError("Data must be in N×3 or N×6 format")
+        
     fig = plt.figure(figsize=(10, 8))
     
     if is_calibrated:
@@ -161,11 +184,16 @@ def full_verification(raw_path):
     
     try:
         raw = np.loadtxt(raw_path, delimiter=',', ndmin=2)
-        if raw.ndim != 2 or raw.shape[1] != 3:
-            raise ValueError("Raw data format error")
+        # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns
+        if raw.ndim == 2 and raw.shape[1] == 6:
+            mag_data = raw[:, :3]
+        elif raw.ndim == 2 and raw.shape[1] == 3:
+            mag_data = raw
+        else:
+            raise ValueError("Raw data format error - must be N×3 or N×6")
         
         # Plot raw data 3D visualization
-        plot_3d_data(raw, "Raw Magnetic Data", raw_path.replace('.csv', '_raw.png'))
+        plot_3d_data(mag_data, "Raw Magnetic Data", raw_path.replace('.csv', '_raw.png'))
         
         # Perform fitting
         b, A = verify_raw_data(raw_path)
@@ -176,7 +204,13 @@ def full_verification(raw_path):
         calibrated = ellipsoid_to_sphere(raw, b, A)
         
         # Save calibrated data
-        cal_path = raw_path.replace('raw_', 'cal_').replace('.csv', '_calibrated.csv')
+        cal_path = raw_path.replace('raw_', 'cal_').replace('.csv', '_calibrated.csv') 
+        # If original file was raw_mag_with_orientation.csv, make it cal_mag_with_orientation.csv
+        if "with_orientation" in raw_path:
+            cal_path = raw_path.replace('raw_mag_with_orientation.csv', 'cal_mag_with_orientation.csv')
+        else:
+            cal_path = raw_path.replace('raw_mag.csv', 'cal_mag.csv')
+            
         np.savetxt(cal_path, calibrated, delimiter=',', fmt='%.8f')
         print(f"\nCalibrated data saved to: {cal_path}")
         
@@ -217,12 +251,22 @@ if __name__ == "__main__":
     
     try:
         if mode == "raw":
+            raw = np.loadtxt(csv_path, delimiter=',', ndmin=2)
+            # Handle 6-column data (mx, my, mz, pitch, roll, yaw) by using only first 3 columns for plotting
+            if raw.ndim == 2 and raw.shape[1] == 6:
+                mag_data = raw[:, :3]
+            elif raw.ndim == 2 and raw.shape[1] == 3:
+                mag_data = raw
+            else:
+                raise ValueError("Data must be in N×3 or N×6 format")
+                
             verify_raw_data(csv_path)
-            plot_3d_data(np.loadtxt(csv_path, delimiter=','), "Raw Magnetic Data", csv_path.replace('.csv', '.png'))
+            plot_3d_data(mag_data, "Raw Magnetic Data", csv_path.replace('.csv', '.png'))
         
         elif mode == "cal":
             result = verify_calibrated_data(csv_path)
-            plot_3d_data(np.loadtxt(csv_path, delimiter=','), "Calibrated Magnetic Data", csv_path.replace('.csv', '.png'), True)
+            calibrated = np.loadtxt(csv_path, delimiter=',')
+            plot_3d_data(calibrated, "Calibrated Magnetic Data", csv_path.replace('.csv', '.png'), True)
             sys.exit(0 if result else 1)
         
         elif mode == "full":

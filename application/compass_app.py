@@ -127,9 +127,7 @@ def fit_ellipsoid_3d(points):
         return None, None
 
     b = -np.linalg.solve(Q, [G, H, I]) / 2
-    scale = np.sqrt(1.0 / eig_vals)
-    # 更稳定和正确的计算方式
-    A_cal = np.linalg.inv(eig_vecs @ np.diag(scale) @ eig_vecs.T)
+    A_cal = eig_vecs @ np.diag(np.sqrt(eig_vals)) @ eig_vecs.T
     # 确保行列式为正（物理意义）
     if np.linalg.det(A_cal) < 0:
         A_cal = -A_cal
@@ -251,7 +249,7 @@ class CalibrationApp(QObject):
         self.freeze_A = None
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_3d_plot_safe)
-        self.timer.start(200)
+        self.timer.start(50)
 
         # ---------- 按钮信号 ----------
         self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
@@ -317,7 +315,7 @@ class CalibrationApp(QObject):
         self.freeze_data = None
         self.freeze_b = None
         self.freeze_A = None
-        self.timer.start(200)
+        self.timer.start(50)
         self.window.step0_btn.setEnabled(True)
         self.window.step1_btn.setEnabled(False)
         self.window.step2_btn.setEnabled(False)
@@ -365,7 +363,7 @@ class CalibrationApp(QObject):
         np.savetxt(raw_csv_path, np.array(self.freeze_data), delimiter=',', fmt='%.6f')
 
         # 6. 保存 mag_calibration.h
-        c_code = generate_c_code_3d(self.freeze_b, self.freeze_A)
+        c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
         c_path = os.path.join(CALIB_DIR, "mag_calibration.h")
         with open(c_path, 'w', encoding='utf-8') as f:
             f.write(c_code)

@@ -250,34 +250,50 @@ class CalibrationApp(QObject):
 
     def check_step_completion(self, step: int):
         start = self.step_start_idx[step]
-        data = np.array(self.mag3d_data[start:])  # 只检查本步骤新增的数据
-        if len(data) < 10:
+        data = np.array(self.mag3d_data[start:])
+
+        # 基础健壮
+        if data.ndim != 2 or data.shape[0] < 100 or data.shape[1] < 6:
+            self.window.set_status(f"Step {step+1} 数据不足 ({len(data)})")
             return
 
-        # 三步统一用 yaw（第 5 列）
-        angles = data[:, 5]
-        angles = np.where(angles < 0, angles + 360, angles)  # 0-360°
+        yaw   = np.where(data[:, 5] < 0, data[:, 5] + 360, data[:, 5])
+        pitch = data[:, 3]
+        roll  = data[:, 4]
 
-        # 10° 一格
-        bins = np.arange(0, 361, 10)
-        counts, _ = np.histogram(angles, bins=bins)
-        filled = np.sum(counts >= 10)
-        total = len(bins) - 1
+        bins_yaw  = np.arange(0, 361, GRID_STEP_DEG)
+        bins_pr   = np.arange(-90, 91, GRID_STEP_DEG)
 
-        # 只打印当前角度 + 缺的格子
-        curr = angles[-1] if len(angles) else float('nan')
-        print(f"[Step{step}] 当前={curr:6.2f}°  完成{filled:2d}/{total}")
+        cnt_yaw,   _ = np.histogram(yaw,   bins=bins_yaw)
+        cnt_pitch, _ = np.histogram(pitch, bins=bins_pr)
+        cnt_roll,  _ = np.histogram(roll,  bins=bins_pr)
 
-        for i, cnt in enumerate(counts):
-            if cnt < 10:
-                lo, hi = bins[i], bins[i + 1]
-                inside = angles[(angles >= lo) & (angles < hi)]
-                print(f"  缺 {lo:3.0f}-{hi:3.0f}°  已采 {inside}")
+        # 每轴满格判定
+        yaw_ok   = (cnt_yaw   >= POINTS_PER_GRID).all()
+        pitch_ok = (cnt_pitch >= POINTS_PER_GRID).all()
+        roll_ok  = (cnt_roll  >= POINTS_PER_GRID).all()
 
-        # 36 格全部 ≥10 点才进入下一步
-        if filled == total:
+        # 只检查当前步骤需要的轴
+        if step == 0:      # Step 1 水平：只看 yaw
+            ok = yaw_ok
+        elif step == 1:    # Step 2 俯仰：只看 pitch
+            ok = pitch_ok
+        else:              # Step 3 横滚：只看 roll
+            ok = roll_ok
+
+        # 状态提示
+        self.window.set_status(
+            f"Step {step+1} 运行中... "
+            f"yaw:{np.sum(cnt_yaw>=POINTS_PER_GRID)}/{len(bins_yaw)-1}  "
+            f"pitch:{np.sum(cnt_pitch>=POINTS_PER_GRID)}/{len(bins_pr)-1}  "
+            f"roll:{np.sum(cnt_roll>=POINTS_PER_GRID)}/{len(bins_pr)-1}"
+        )
+
+        # 满足 → 下一步
+        if ok:
             self.check_timer.stop()
             self.thread.stop()
+
             btn_list = [self.window.step0_btn, self.window.step1_btn, self.window.step2_btn]
             if step < 2:
                 btn_list[step + 1].setEnabled(True)

@@ -17,12 +17,13 @@ from PyQt5.QtCore import (
 )
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.colors import LightSource
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas2D
+from PyQt5.QtWidgets import QDialog, QVBoxLayout
 from config import (
     CALIBRATION_DURATION, MIN_3D_POINTS,
     ANGLE_GATE_DEG, DIST_GATE_CM,
     UNIT_SPHERE_SCALE, DECIMAL_PRECISION
 )
-# 1. 在 compass_app.py 的 import 区末尾追加
 import os
 CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
 os.makedirs(CALIB_DIR, exist_ok=True)
@@ -39,96 +40,53 @@ class SerialThread(QThread):
         self.bridge = bridge
         self.port, self.baud = port, baud
         self.running = True
-        self.cache_mag = None
-        self.cache_ang = None
 
     def run(self):
-        # 1. 删除重复 import，提升启动速度
         try:
             with serial.Serial(self.port, self.baud, timeout=1) as ser:
-                last_ang = None     # [pitch, roll, yaw]
-                last_xyz = None     # [mx, my, mz]
-
+                last_ang = None
+                last_xyz = None
                 while self.running:
                     line = ser.readline().decode(errors='ignore')
-
-                    # 2. 正则支持指数符号
                     m = re.search(r'mag_x=\s*([-\d\.eE+-]+),\s*mag_y=\s*([-\d\.eE+-]+),\s*mag_z=\s*([-\d\.eE+-]+)', line)
                     if m:
-                        self.cache_mag = list(map(float, m.groups()))
-
+                        mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
                     a = re.search(r'pitch=\s*([-\d\.eE+-]+).*roll=\s*([-\d\.eE+-]+).*yaw=\s*([-\d\.eE+-]+)', line)
                     if a:
-                        self.cache_ang = list(map(float, a.groups()))
-
-                    if self.cache_mag and self.cache_ang:
-                        mx, my, mz = -self.cache_mag[1], -self.cache_mag[0], self.cache_mag[2]
-                        pitch, roll, yaw = self.cache_ang
+                        pitch, roll, yaw = map(float, a.groups())
+                    if 'mx' in locals() and 'pitch' in locals():
                         xyz = np.array([mx, my, mz])
                         ang = np.array([pitch, roll, yaw])
-
-                        # 角度门控：任一方向变化≥阈值即有效
                         if last_ang is None or np.any(np.abs(ang - last_ang) >= ANGLE_GATE_DEG):
                             last_ang = ang
                         else:
-                            self.cache_mag = self.cache_ang = None
                             continue
-
-                        # 磁力稀疏化
                         if last_xyz is None or np.linalg.norm(xyz - last_xyz) >= DIST_GATE_CM * 0.01:
                             last_xyz = xyz
                             self.bridge.new_data.emit(mx, my, mz, pitch, roll, yaw)
-
-                        self.cache_mag = self.cache_ang = None
         except Exception as e:
-            # 6. 串口异常弹窗
             QMessageBox.critical(None, "Serial Error", str(e))
+
     def stop(self):
         self.running = False
 
 # -----------------------------
-# 2. 核心函数：椭球拟合 + C 代码生成
+# 2. 核心函数
 # -----------------------------
 def fit_ellipsoid_3d(points):
-    # 修改函数以处理带标签的数据
-    pts = np.asarray(points, dtype=float)
-    if pts.ndim == 2 and pts.shape[1] == 6:
-        # 如果是带标签的数据，只使用前3列（mx, my, mz）
-        pts = pts[:, :3]
-    elif pts.ndim == 2 and pts.shape[1] != 3:
-        print("点数据格式错误")
-        return None, None
-        
+    pts = np.asarray(points, dtype=float)[:, :3]
     if pts.shape[0] < 10:
-        print("点数不足 10")
         return None, None
-
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
     D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
-
-    # Tikhonov 正则化
     lam = 1e-6 * np.trace(D.T @ D) / D.shape[1]
-    DTD = D.T @ D + lam * np.eye(10)
-    DTy = D.T @ np.ones_like(x)
-    try:
-        coeffs = np.linalg.solve(DTD, DTy)
-    except np.linalg.LinAlgError:
-        print("正则化后仍无法求解")
-        return None, None
-
+    coeffs = np.linalg.solve(D.T @ D + lam * np.eye(10), D.T @ np.ones_like(x))
     Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
-    Q = np.array([[Aq, Dq/2, Eq/2],
-                  [Dq/2, Bq, Fq/2],
-                  [Eq/2, Fq/2, Cq]])
+    Q = np.array([[Aq, Dq/2, Eq/2], [Dq/2, Bq, Fq/2], [Eq/2, Fq/2, Cq]])
     eig_vals, eig_vecs = np.linalg.eigh(Q)
     eig_vals = np.maximum(eig_vals, 1e-6)
-    if np.any(eig_vals <= 0):
-        print("强制正定后仍失败")
-        return None, None
-
     b = -np.linalg.solve(Q, [G, H, I]) / 2
     A_cal = eig_vecs @ np.diag(np.sqrt(eig_vals)) @ eig_vecs.T
-    # 确保行列式为正（物理意义）
     if np.linalg.det(A_cal) < 0:
         A_cal = -A_cal
     return b, A_cal
@@ -137,52 +95,29 @@ def generate_c_code_3d(b, A):
     if b is None or A is None:
         return "/* Error: Calibration failed */"
     bx, by, bz = b
-    # 确保软铁矩阵具有正的行列式（物理意义）
-    if np.linalg.det(A) < 0:
-        A = -A
-    # 4. 小数精度 6 → 8
+    A = np.linalg.inv(A)
     lines = [
         "/* 3D mag calibration (auto) */",
-        f"const float HARD_IRON[3] = {{{bx:.{DECIMAL_PRECISION}f}f, {by:.{DECIMAL_PRECISION}f}f, {bz:.{DECIMAL_PRECISION}f}f}};",
+        f"const float HARD_IRON[3] = {{{bx:.8f}f, {by:.8f}f, {bz:.8f}f}};",
         "const float SOFT_IRON[3][3] = {",
-        f"  {{{A[0, 0]:.{DECIMAL_PRECISION}f}f, {A[0, 1]:.{DECIMAL_PRECISION}f}f, {A[0, 2]:.{DECIMAL_PRECISION}f}f}},",
-        f"  {{{A[1, 0]:.{DECIMAL_PRECISION}f}f, {A[1, 1]:.{DECIMAL_PRECISION}f}f, {A[1, 2]:.{DECIMAL_PRECISION}f}f}},",
-        f"  {{{A[2, 0]:.{DECIMAL_PRECISION}f}f, {A[2, 1]:.{DECIMAL_PRECISION}f}f, {A[2, 2]:.{DECIMAL_PRECISION}f}f}}",
+        f"  {{{A[0,0]:.8f}f, {A[0,1]:.8f}f, {A[0,2]:.8f}f}},",
+        f"  {{{A[1,0]:.8f}f, {A[1,1]:.8f}f, {A[1,2]:.8f}f}},",
+        f"  {{{A[2,0]:.8f}f, {A[2,1]:.8f}f, {A[2,2]:.8f}f}}",
         "};"
     ]
     return "\n".join(lines)
+
 def raw_to_unit(raw_xyz, b):
-    """
-    仅去掉硬铁偏移，不做软铁变换。
-    用于 Raw Unit Sphere 可视化，使其中心落在原点。
-    """
-    # 处理带标签的数据
-    if raw_xyz.ndim == 2 and raw_xyz.shape[1] == 6:
-        raw_xyz = raw_xyz[:, :3]
-    elif raw_xyz.ndim == 2 and raw_xyz.shape[1] != 3:
-        raise ValueError("数据格式错误")
-        
-    centered = raw_xyz - b
+    centered = raw_xyz[:, :3] - b
     length = np.linalg.norm(centered, axis=1, keepdims=True)
-    # 防 0 除
     length[length == 0] = 1
     return centered / length
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
-    """一键：原始磁向量 → 单位球向量"""
-    # 处理带标签的数据
-    if raw_xyz.ndim == 2 and raw_xyz.shape[1] == 6:
-        raw_xyz = raw_xyz[:, :3]
-    elif raw_xyz.ndim == 2 and raw_xyz.shape[1] != 3:
-        raise ValueError("数据格式错误")
-        
-    # 硬铁校正
-    centered = raw_xyz - b
-    # 软铁校正 - 修正矩阵变换方向
-    sphere = centered @ A  # 而不是 (A @ centered.T).T
-    # 归一化
+    centered = raw_xyz[:, :3] - b
+    sphere = centered @ A
     norm = np.linalg.norm(sphere, axis=1, keepdims=True)
-    norm[norm == 0] = 1  # 防止除零错误
+    norm[norm == 0] = 1
     return sphere / norm
 
 def draw_unit_sphere(ax, r=1.0):
@@ -195,14 +130,6 @@ def draw_unit_sphere(ax, r=1.0):
     rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
     ax.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
 
-def calculate_heading(mx, my):
-    """计算航向角"""
-    heading = np.arctan2(my, mx)
-    # 转换为度数并归一化到0-360
-    heading_deg = np.degrees(heading)
-    heading_deg = (heading_deg + 360) % 360
-    return heading_deg
-
 # -----------------------------
 # 3. CalibrationApp
 # -----------------------------
@@ -212,34 +139,29 @@ class CalibrationApp(QObject):
         self.app = QApplication(sys.argv)
         self.window = CompassMainWindow()
 
-        # ---------- 3D 画布 ----------
-        # 1. Raw 3D Mag（最上方）
+        # 3D 画布
         self.fig3d = plt.figure()
         self.canvas3d = FigureCanvas(self.fig3d)
         self.ax3d = self.fig3d.add_subplot(111, projection='3d')
         self.ax3d.set_title("Raw 3D Mag (μT)")
         self.window.central_layout.addWidget(self.canvas3d)
 
-        # 2. Raw Unit Sphere（左下）
         self.fig_raw_sphere = plt.figure()
         self.canvas_raw_sphere = FigureCanvas(self.fig_raw_sphere)
         self.ax_raw_sphere = self.fig_raw_sphere.add_subplot(111, projection='3d')
         self.ax_raw_sphere.set_title("Raw Unit Sphere")
 
-        # 3. Calibrated 3D Mag（右下）
         self.fig3d_cal = plt.figure()
         self.canvas3d_cal = FigureCanvas(self.fig3d_cal)
         self.ax3d_cal = self.fig3d_cal.add_subplot(111, projection='3d')
         self.ax3d_cal.set_title("Calibrated on Unit Sphere")
 
-        # 水平布局：左 Raw Sphere，右 Calibrated
-        from PyQt5.QtWidgets import QHBoxLayout
         hbox = QHBoxLayout()
         hbox.addWidget(self.canvas_raw_sphere)
         hbox.addWidget(self.canvas3d_cal)
         self.window.central_layout.addLayout(hbox)
 
-        # ---------- 数据桥 & 定时器 ----------
+        # 数据桥 & 定时器
         self.data_bridge = DataBridge()
         self.data_bridge.new_data[float, float, float, float, float, float].connect(
             self.handle_new_data, Qt.QueuedConnection)
@@ -251,7 +173,7 @@ class CalibrationApp(QObject):
         self.timer.timeout.connect(self._update_3d_plot_safe)
         self.timer.start(50)
 
-        # ---------- 按钮信号 ----------
+        # 按钮信号
         self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
         self.window.step1_btn.clicked.connect(lambda: self.start_step(1))
         self.window.step2_btn.clicked.connect(lambda: self.start_step(2))
@@ -262,7 +184,6 @@ class CalibrationApp(QObject):
     @pyqtSlot(float, float, float, float, float, float)
     def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
         if self.freeze_data is None:
-            # 添加带标签的磁力数据 [mx, my, mz, pitch, roll, yaw]
             self.mag3d_data.append([mx, my, mz, pitch, roll, yaw])
 
     def _update_3d_plot_safe(self):
@@ -272,15 +193,11 @@ class CalibrationApp(QObject):
             self._update_3d_plot()
 
     def _update_3d_plot(self):
-        try:
-            self.ax3d.clear()
-            # 只使用前3个元素（mx, my, mz）绘制3D图
-            xyz = np.array(self.mag3d_data)[:, :3] if self.mag3d_data else np.empty((0, 3))
-            self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
-            self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
-            self.canvas3d.draw()
-        except Exception as e:
-            print(f"Plot error: {e}")
+        xyz = np.array(self.mag3d_data)[:, :3]
+        self.ax3d.clear()
+        self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
+        self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
+        self.canvas3d.draw()
 
     def start_step(self, step: int):
         port = self.window.port_combo.currentText()
@@ -309,7 +226,6 @@ class CalibrationApp(QObject):
             QTimer.singleShot(CALIBRATION_DURATION * 1000, self.finish_steps)
         self.window.set_status(f"Step {step + 1} running {CALIBRATION_DURATION}s")
 
-    # 7. 重置功能：清空数据，按钮复位，可立即重新校准
     def reset_calibration(self):
         self.mag3d_data.clear()
         self.freeze_data = None
@@ -322,7 +238,6 @@ class CalibrationApp(QObject):
         self.window.view3d_btn.setEnabled(False)
         self.window.set_status("Reset complete. Start new calibration.")
 
-    # 8. 校准完成处理
     def finish_steps(self):
         if self.thread:
             self.thread.stop()
@@ -337,49 +252,24 @@ class CalibrationApp(QObject):
             return
 
         self.timer.stop()
-
-        # 1. 更新 Raw 3D 图
-        xyz = np.array(self.freeze_data)[:, :3]  # 只取磁力数据部分
-        self.ax3d.clear()
-        self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
-        self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
-        self.canvas3d.draw()
-
-        # 2. 计算校准后的单位球数据
+        xyz = np.array(self.freeze_data)[:, :3]
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
 
-        # 3. 统一文件夹
-        import os
-        CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
         os.makedirs(CALIB_DIR, exist_ok=True)
-
-        # 4. 保存 calibrated_mag.csv
-        cal_csv_path = os.path.join(CALIB_DIR, "calibrated_mag.csv")
-        np.savetxt(cal_csv_path, pts_cal_unit, delimiter=',', fmt='%.8f')
-        self.window.set_status(f"Calibrated data saved to {cal_csv_path}")
-
-        # 5. 保存 raw_mag.csv (包含欧拉角标签)
-        raw_csv_path = os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv")
-        np.savetxt(raw_csv_path, np.array(self.freeze_data), delimiter=',', fmt='%.6f')
-
-        # 6. 保存 mag_calibration.h
+        np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"), pts_cal_unit, delimiter=',', fmt='%.8f')
+        np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"), np.array(self.freeze_data), delimiter=',', fmt='%.6f')
         c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
-        c_path = os.path.join(CALIB_DIR, "mag_calibration.h")
-        with open(c_path, 'w', encoding='utf-8') as f:
+        with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
             f.write(c_code)
 
-        # 7. 更新校准球图
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
-        self.ax3d_cal.scatter(
-            pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
-            c=np.linalg.norm(pts_cal_unit, axis=1),
-            s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
+        self.ax3d_cal.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
+                              c=np.linalg.norm(pts_cal_unit, axis=1), s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
         self.ax3d_cal.set_title("Calibrated on Unit Sphere")
         self.ax3d_cal.set_box_aspect([1, 1, 1])
         self.canvas3d_cal.draw()
 
-        # 8. 弹窗显示代码
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
@@ -391,18 +281,16 @@ class CalibrationApp(QObject):
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
 
-        # 只取磁力数据部分
         xyz = np.array(self.freeze_data)[:, :3]
         n = len(xyz)
         k = n // 3
-
         colors = ['#ff0080', '#00e5ff', '#8000FF']
         labels = ['Level', 'Tilt', 'Stern']
 
-        # 1. Raw 3D Mag（最上方）——保持不变
+        # Raw 3D
         self.ax3d.clear()
         for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = xyz[i * k : (i + 1) * k]
+            seg = xyz[i * k:(i + 1) * k]
             if len(seg):
                 self.ax3d.scatter(*seg.T, c=c, s=8, label=lab, depthshade=False)
         self.ax3d.set_title("Raw 3D Mag (μT)")
@@ -410,23 +298,20 @@ class CalibrationApp(QObject):
         self.ax3d.set_box_aspect([1, 1, 1])
         self.canvas3d.draw()
 
-        # 2. Raw Unit Sphere（左下）——先减硬铁再归一化
+        # Raw Unit Sphere
         raw_unit = raw_to_unit(xyz, self.freeze_b)
         self.ax_raw_sphere.clear()
         draw_unit_sphere(self.ax_raw_sphere, r=1.0)
         for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = raw_unit[i * k : (i + 1) * k]
+            seg = raw_unit[i * k:(i + 1) * k]
             if len(seg):
                 self.ax_raw_sphere.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
         self.ax_raw_sphere.set_title("Raw Unit Sphere")
-        self.ax_raw_sphere.set_xlim([-1, 1])
-        self.ax_raw_sphere.set_ylim([-1, 1])
-        self.ax_raw_sphere.set_zlim([-1, 1])
         self.ax_raw_sphere.set_box_aspect([1, 1, 1])
         self.ax_raw_sphere.legend()
         self.canvas_raw_sphere.draw()
 
-        # 3. Calibrated Unit Sphere（右下）——保持完整软/硬铁变换
+        # Calibrated Unit Sphere
         pts_centered = xyz - self.freeze_b
         pts_cal = (self.freeze_A @ pts_centered.T).T
         pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
@@ -434,60 +319,64 @@ class CalibrationApp(QObject):
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
         for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = pts_cal_unit[i * k : (i + 1) * k]
+            seg = pts_cal_unit[i * k:(i + 1) * k]
             if len(seg):
                 self.ax3d_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
         self.ax3d_cal.set_title("Calibrated on Unit Sphere")
-        self.ax3d_cal.set_xlim([-1, 1])
-        self.ax3d_cal.set_ylim([-1, 1])
-        self.ax3d_cal.set_zlim([-1, 1])
         self.ax3d_cal.set_box_aspect([1, 1, 1])
         self.ax3d_cal.legend()
         self.canvas3d_cal.draw()
 
-        # 动画
+        # 3D 动画
         elev = 20
         self.anim1 = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(elev, i % 360), frames=360, interval=50)
         self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
         self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
+
+        # XY 平面图（模态，不会闪退）
+        dlg2d = QDialog(self.window)
+        dlg2d.setWindowTitle("Calibrated XY Projection")
+        dlg2d.resize(450, 450)
+        layout = QVBoxLayout(dlg2d)
+        fig2d, ax2d = plt.subplots()
+        ax2d.set_aspect('equal')
+        ax2d.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], s=4)
+        circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+        ax2d.add_patch(circle)
+        ax2d.set_title("Calibrated XY Plane Projection")
+        canvas2d = FigureCanvas2D(fig2d)
+        layout.addWidget(canvas2d)
+        dlg2d.setLayout(layout)
+        dlg2d.exec_()
+
     @pyqtSlot()
     def on_algo3d(self):
-        """
-        CSV → 3-D 椭球校准 → 单位球可视化（Raw 先减硬铁，再归一化）
-        """
         fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
         if not fname:
             return
         try:
             raw = np.loadtxt(fname, delimiter=',', ndmin=2)
-            if raw.shape[1] != 3 and raw.shape[1] != 6:
+            if raw.shape[1] not in (3, 6):
                 raise ValueError("CSV must be N×3 or N×6")
 
-            # 1. 椭球拟合
             b, A = fit_ellipsoid_3d(raw)
             if b is None or A is None:
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return
 
-            # 2. 仅去硬铁 -> 单位球（用于 Raw Unit Sphere 效果）
             pts_raw_unit = raw_to_unit(raw, b)
-
-            # 3. 完整校准（软铁+硬铁）
             pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
 
-            # 4. 分段颜色
-            n = len(pts_raw_unit)          # 两段都用同一分段
+            n = len(pts_raw_unit)
             k = n // 3
             colors = ['#ff0080', '#00e5ff', '#8000FF']
             sections = ['Level', 'Tilt', 'Stern']
 
-            # 5. 弹窗 + 3D
             dlg = QDialog(self.window)
             dlg.setWindowTitle("Algorithm 3D View")
             dlg.resize(900, 600)
 
             fig = plt.figure(figsize=(9, 6))
-            # 左：仅去硬铁
             ax_raw = fig.add_subplot(121, projection='3d')
             ax_raw.set_title("Raw Unit Sphere (Hard-Iron Only)")
             ax_raw.set_box_aspect([1, 1, 1])
@@ -498,7 +387,6 @@ class CalibrationApp(QObject):
                     ax_raw.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
             ax_raw.legend()
 
-            # 右：完整校准
             ax_cal = fig.add_subplot(122, projection='3d')
             ax_cal.set_title("Calibrated Unit Sphere")
             ax_cal.set_box_aspect([1, 1, 1])
@@ -513,12 +401,462 @@ class CalibrationApp(QObject):
             lay = QVBoxLayout(dlg)
             lay.addWidget(canvas)
 
-            # 动画
+            # 3D 动画
             from matplotlib.animation import FuncAnimation
-            dlg.anim1 = FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
-            dlg.anim2 = FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
-            dlg.exec_()
+            FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
+            FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
 
+            # XY 平面图（模态）
+            dlg2d = QDialog(self.window)
+            dlg2d.setWindowTitle("Calibrated XY Projection")
+            dlg2d.resize(450, 450)
+            layout = QVBoxLayout(dlg2d)
+            fig2d, ax2d = plt.subplots()
+            ax2d.set_aspect('equal')
+            ax2d.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], s=4)
+            circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+            ax2d.add_patch(circle)
+            ax2d.set_title("Calibrated XY Plane Projection")
+            canvas2d = FigureCanvas2D(fig2d)
+            layout.addWidget(canvas2d)
+            dlg2d.setLayout(layout)
+            dlg2d.exec_()
+
+            dlg.exec_()
+        except Exception as e:
+            QMessageBox.critical(self.window, "Error", str(e))
+
+    def run(self):
+        self.window.show()
+        sys.exit(self.app.exec_())
+
+if __name__ == "__main__":
+    app = CalibrationApp()
+    app.run()# compass_app.py
+# 磁力计三步校准上位机
+import sys
+import serial
+import threading
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel,
+    QComboBox, QHBoxLayout, QMessageBox, QFileDialog, QDialog, QTextEdit
+)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from compass_ui import CompassMainWindow, ResultDialog
+from PyQt5.QtCore import (
+    QTimer, pyqtSlot, pyqtSignal, QObject, QThread, Qt
+)
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from matplotlib.colors import LightSource
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas2D
+from PyQt5.QtWidgets import QDialog, QVBoxLayout
+from config import (
+    CALIBRATION_DURATION, MIN_3D_POINTS,
+    ANGLE_GATE_DEG, DIST_GATE_CM,
+    UNIT_SPHERE_SCALE, DECIMAL_PRECISION
+)
+import os
+CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
+os.makedirs(CALIB_DIR, exist_ok=True)
+
+# -----------------------------
+# 1. 线程安全串口读取（角度门控+稀疏化）
+# -----------------------------
+class DataBridge(QObject):
+    new_data = pyqtSignal(float, float, float, float, float, float)
+
+class SerialThread(QThread):
+    def __init__(self, port, baud, bridge):
+        super().__init__()
+        self.bridge = bridge
+        self.port, self.baud = port, baud
+        self.running = True
+
+    def run(self):
+        try:
+            with serial.Serial(self.port, self.baud, timeout=1) as ser:
+                last_ang = None
+                last_xyz = None
+                while self.running:
+                    line = ser.readline().decode(errors='ignore')
+                    m = re.search(r'mag_x=\s*([-\d\.eE+-]+),\s*mag_y=\s*([-\d\.eE+-]+),\s*mag_z=\s*([-\d\.eE+-]+)', line)
+                    if m:
+                        mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
+                    a = re.search(r'pitch=\s*([-\d\.eE+-]+).*roll=\s*([-\d\.eE+-]+).*yaw=\s*([-\d\.eE+-]+)', line)
+                    if a:
+                        pitch, roll, yaw = map(float, a.groups())
+                    if 'mx' in locals() and 'pitch' in locals():
+                        xyz = np.array([mx, my, mz])
+                        ang = np.array([pitch, roll, yaw])
+                        if last_ang is None or np.any(np.abs(ang - last_ang) >= ANGLE_GATE_DEG):
+                            last_ang = ang
+                        else:
+                            continue
+                        if last_xyz is None or np.linalg.norm(xyz - last_xyz) >= DIST_GATE_CM * 0.01:
+                            last_xyz = xyz
+                            self.bridge.new_data.emit(mx, my, mz, pitch, roll, yaw)
+        except Exception as e:
+            QMessageBox.critical(None, "Serial Error", str(e))
+
+    def stop(self):
+        self.running = False
+
+# -----------------------------
+# 2. 核心函数
+# -----------------------------
+def fit_ellipsoid_3d(points):
+    pts = np.asarray(points, dtype=float)[:, :3]
+    if pts.shape[0] < 10:
+        return None, None
+    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
+    lam = 1e-6 * np.trace(D.T @ D) / D.shape[1]
+    coeffs = np.linalg.solve(D.T @ D + lam * np.eye(10), D.T @ np.ones_like(x))
+    Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
+    Q = np.array([[Aq, Dq/2, Eq/2], [Dq/2, Bq, Fq/2], [Eq/2, Fq/2, Cq]])
+    eig_vals, eig_vecs = np.linalg.eigh(Q)
+    eig_vals = np.maximum(eig_vals, 1e-6)
+    b = -np.linalg.solve(Q, [G, H, I]) / 2
+    A_cal = eig_vecs @ np.diag(np.sqrt(eig_vals)) @ eig_vecs.T
+    if np.linalg.det(A_cal) < 0:
+        A_cal = -A_cal
+    return b, A_cal
+
+def generate_c_code_3d(b, A):
+    if b is None or A is None:
+        return "/* Error: Calibration failed */"
+    bx, by, bz = b
+    A = np.linalg.inv(A)
+    lines = [
+        "/* 3D mag calibration (auto) */",
+        f"const float HARD_IRON[3] = {{{bx:.8f}f, {by:.8f}f, {bz:.8f}f}};",
+        "const float SOFT_IRON[3][3] = {",
+        f"  {{{A[0,0]:.8f}f, {A[0,1]:.8f}f, {A[0,2]:.8f}f}},",
+        f"  {{{A[1,0]:.8f}f, {A[1,1]:.8f}f, {A[1,2]:.8f}f}},",
+        f"  {{{A[2,0]:.8f}f, {A[2,1]:.8f}f, {A[2,2]:.8f}f}}",
+        "};"
+    ]
+    return "\n".join(lines)
+
+def raw_to_unit(raw_xyz, b):
+    centered = raw_xyz[:, :3] - b
+    length = np.linalg.norm(centered, axis=1, keepdims=True)
+    length[length == 0] = 1
+    return centered / length
+
+def ellipsoid_to_sphere(raw_xyz, b, A):
+    centered = raw_xyz[:, :3] - b
+    sphere = centered @ A
+    norm = np.linalg.norm(sphere, axis=1, keepdims=True)
+    norm[norm == 0] = 1
+    return sphere / norm
+
+def draw_unit_sphere(ax, r=1.0):
+    u = np.linspace(0, 2 * np.pi, 60)
+    v = np.linspace(0, np.pi, 30)
+    x = r * np.outer(np.cos(u), np.sin(v))
+    y = r * np.outer(np.sin(u), np.sin(v))
+    z = r * np.outer(np.ones_like(u), np.cos(v))
+    ls = LightSource(azdeg=45, altdeg=45)
+    rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
+    ax.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
+
+# -----------------------------
+# 3. CalibrationApp
+# -----------------------------
+class CalibrationApp(QObject):
+    def __init__(self):
+        super().__init__()
+        self.app = QApplication(sys.argv)
+        self.window = CompassMainWindow()
+
+        # 3D 画布
+        self.fig3d = plt.figure()
+        self.canvas3d = FigureCanvas(self.fig3d)
+        self.ax3d = self.fig3d.add_subplot(111, projection='3d')
+        self.ax3d.set_title("Raw 3D Mag (μT)")
+        self.window.central_layout.addWidget(self.canvas3d)
+
+        self.fig_raw_sphere = plt.figure()
+        self.canvas_raw_sphere = FigureCanvas(self.fig_raw_sphere)
+        self.ax_raw_sphere = self.fig_raw_sphere.add_subplot(111, projection='3d')
+        self.ax_raw_sphere.set_title("Raw Unit Sphere")
+
+        self.fig3d_cal = plt.figure()
+        self.canvas3d_cal = FigureCanvas(self.fig3d_cal)
+        self.ax3d_cal = self.fig3d_cal.add_subplot(111, projection='3d')
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+
+        hbox = QHBoxLayout()
+        hbox.addWidget(self.canvas_raw_sphere)
+        hbox.addWidget(self.canvas3d_cal)
+        self.window.central_layout.addLayout(hbox)
+
+        # 数据桥 & 定时器
+        self.data_bridge = DataBridge()
+        self.data_bridge.new_data[float, float, float, float, float, float].connect(
+            self.handle_new_data, Qt.QueuedConnection)
+        self.mag3d_data = []
+        self.freeze_data = None
+        self.freeze_b = None
+        self.freeze_A = None
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._update_3d_plot_safe)
+        self.timer.start(50)
+
+        # 按钮信号
+        self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
+        self.window.step1_btn.clicked.connect(lambda: self.start_step(1))
+        self.window.step2_btn.clicked.connect(lambda: self.start_step(2))
+        self.window.view3d_btn.clicked.connect(self.view_result_3d)
+        self.window.algo3d_btn.clicked.connect(self.on_algo3d)
+        self.window.reset_btn.clicked.connect(self.reset_calibration)
+
+    @pyqtSlot(float, float, float, float, float, float)
+    def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
+        if self.freeze_data is None:
+            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw])
+
+    def _update_3d_plot_safe(self):
+        if self.freeze_data is not None:
+            return
+        if self.mag3d_data:
+            self._update_3d_plot()
+
+    def _update_3d_plot(self):
+        xyz = np.array(self.mag3d_data)[:, :3]
+        self.ax3d.clear()
+        self.ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c='b', s=5)
+        self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
+        self.canvas3d.draw()
+
+    def start_step(self, step: int):
+        port = self.window.port_combo.currentText()
+        baud = int(self.window.baud_combo.currentText())
+        if "No" in port:
+            QMessageBox.warning(self.window, "Error", "No port")
+            return
+        need = {0: 0, 1: MIN_3D_POINTS, 2: int(MIN_3D_POINTS * 1.5)}[step]
+        if step and len(self.mag3d_data) < need:
+            self.window.set_status(f"Step{step} need ≥{need}")
+            return
+        if step == 0:
+            self.mag3d_data.clear()
+            self.freeze_data = None
+
+        btn_list = [self.window.step0_btn, self.window.step1_btn, self.window.step2_btn]
+        btn_list[step].setEnabled(False)
+
+        self.thread = SerialThread(port, baud, self.data_bridge)
+        self.thread.start()
+        QTimer.singleShot(CALIBRATION_DURATION * 1000, self.thread.stop)
+        if step < 2:
+            QTimer.singleShot(CALIBRATION_DURATION * 1000,
+                              lambda: btn_list[step + 1].setEnabled(True))
+        else:
+            QTimer.singleShot(CALIBRATION_DURATION * 1000, self.finish_steps)
+        self.window.set_status(f"Step {step + 1} running {CALIBRATION_DURATION}s")
+
+    def reset_calibration(self):
+        self.mag3d_data.clear()
+        self.freeze_data = None
+        self.freeze_b = None
+        self.freeze_A = None
+        self.timer.start(50)
+        self.window.step0_btn.setEnabled(True)
+        self.window.step1_btn.setEnabled(False)
+        self.window.step2_btn.setEnabled(False)
+        self.window.view3d_btn.setEnabled(False)
+        self.window.set_status("Reset complete. Start new calibration.")
+
+    def finish_steps(self):
+        if self.thread:
+            self.thread.stop()
+        if len(self.mag3d_data) < MIN_3D_POINTS * 2:
+            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS * 2}")
+            return
+
+        self.freeze_data = list(self.mag3d_data)
+        self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
+        if self.freeze_b is None or self.freeze_A is None:
+            self.window.set_status("3D Calibration failed")
+            return
+
+        self.timer.stop()
+        xyz = np.array(self.freeze_data)[:, :3]
+        pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
+
+        os.makedirs(CALIB_DIR, exist_ok=True)
+        np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"), pts_cal_unit, delimiter=',', fmt='%.8f')
+        np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"), np.array(self.freeze_data), delimiter=',', fmt='%.6f')
+        c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
+        with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
+            f.write(c_code)
+
+        self.ax3d_cal.clear()
+        draw_unit_sphere(self.ax3d_cal, r=1.0)
+        self.ax3d_cal.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
+                              c=np.linalg.norm(pts_cal_unit, axis=1), s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+        self.ax3d_cal.set_box_aspect([1, 1, 1])
+        self.canvas3d_cal.draw()
+
+        self.window.show_result_dialog(c_code)
+        self.window.enable_view3d_btn(True)
+        self.window.set_status("3D Three-Step Done")
+
+    def view_result_3d(self):
+        if self.freeze_data is None:
+            return
+
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+
+        xyz = np.array(self.freeze_data)[:, :3]
+        n = len(xyz)
+        k = n // 3
+        colors = ['#ff0080', '#00e5ff', '#8000FF']
+        labels = ['Level', 'Tilt', 'Stern']
+
+        # Raw 3D
+        self.ax3d.clear()
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = xyz[i * k:(i + 1) * k]
+            if len(seg):
+                self.ax3d.scatter(*seg.T, c=c, s=8, label=lab, depthshade=False)
+        self.ax3d.set_title("Raw 3D Mag (μT)")
+        self.ax3d.legend()
+        self.ax3d.set_box_aspect([1, 1, 1])
+        self.canvas3d.draw()
+
+        # Raw Unit Sphere
+        raw_unit = raw_to_unit(xyz, self.freeze_b)
+        self.ax_raw_sphere.clear()
+        draw_unit_sphere(self.ax_raw_sphere, r=1.0)
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = raw_unit[i * k:(i + 1) * k]
+            if len(seg):
+                self.ax_raw_sphere.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+        self.ax_raw_sphere.set_title("Raw Unit Sphere")
+        self.ax_raw_sphere.set_box_aspect([1, 1, 1])
+        self.ax_raw_sphere.legend()
+        self.canvas_raw_sphere.draw()
+
+        # Calibrated Unit Sphere
+        pts_centered = xyz - self.freeze_b
+        pts_cal = (self.freeze_A @ pts_centered.T).T
+        pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
+
+        self.ax3d_cal.clear()
+        draw_unit_sphere(self.ax3d_cal, r=1.0)
+        for i, (c, lab) in enumerate(zip(colors, labels)):
+            seg = pts_cal_unit[i * k:(i + 1) * k]
+            if len(seg):
+                self.ax3d_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
+        self.ax3d_cal.set_box_aspect([1, 1, 1])
+        self.ax3d_cal.legend()
+        self.canvas3d_cal.draw()
+
+        # 3D 动画
+        elev = 20
+        self.anim1 = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(elev, i % 360), frames=360, interval=50)
+        self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
+        self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
+
+        # XY 平面图（模态，不会闪退）
+        dlg2d = QDialog(self.window)
+        dlg2d.setWindowTitle("Calibrated XY Projection")
+        dlg2d.resize(450, 450)
+        layout = QVBoxLayout(dlg2d)
+        fig2d, ax2d = plt.subplots()
+        ax2d.set_aspect('equal')
+        ax2d.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], s=4)
+        circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+        ax2d.add_patch(circle)
+        ax2d.set_title("Calibrated XY Plane Projection")
+        canvas2d = FigureCanvas2D(fig2d)
+        layout.addWidget(canvas2d)
+        dlg2d.setLayout(layout)
+        dlg2d.exec_()
+
+    @pyqtSlot()
+    def on_algo3d(self):
+        fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
+        if not fname:
+            return
+        try:
+            raw = np.loadtxt(fname, delimiter=',', ndmin=2)
+            if raw.shape[1] not in (3, 6):
+                raise ValueError("CSV must be N×3 or N×6")
+
+            b, A = fit_ellipsoid_3d(raw)
+            if b is None or A is None:
+                QMessageBox.warning(self.window, "Error", "Algorithm failed")
+                return
+
+            pts_raw_unit = raw_to_unit(raw, b)
+            pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
+
+            n = len(pts_raw_unit)
+            k = n // 3
+            colors = ['#ff0080', '#00e5ff', '#8000FF']
+            sections = ['Level', 'Tilt', 'Stern']
+
+            dlg = QDialog(self.window)
+            dlg.setWindowTitle("Algorithm 3D View")
+            dlg.resize(900, 600)
+
+            fig = plt.figure(figsize=(9, 6))
+            ax_raw = fig.add_subplot(121, projection='3d')
+            ax_raw.set_title("Raw Unit Sphere (Hard-Iron Only)")
+            ax_raw.set_box_aspect([1, 1, 1])
+            draw_unit_sphere(ax_raw, r=1.0)
+            for i, (c, lab) in enumerate(zip(colors, sections)):
+                seg = pts_raw_unit[i*k:(i+1)*k]
+                if len(seg):
+                    ax_raw.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+            ax_raw.legend()
+
+            ax_cal = fig.add_subplot(122, projection='3d')
+            ax_cal.set_title("Calibrated Unit Sphere")
+            ax_cal.set_box_aspect([1, 1, 1])
+            draw_unit_sphere(ax_cal, r=1.0)
+            for i, (c, lab) in enumerate(zip(colors, sections)):
+                seg = pts_cal_unit[i*k:(i+1)*k]
+                if len(seg):
+                    ax_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+            ax_cal.legend()
+
+            canvas = FigureCanvas(fig)
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(canvas)
+
+            # 3D 动画
+            from matplotlib.animation import FuncAnimation
+            FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
+            FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
+
+            # XY 平面图（模态）
+            dlg2d = QDialog(self.window)
+            dlg2d.setWindowTitle("Calibrated XY Projection")
+            dlg2d.resize(450, 450)
+            layout = QVBoxLayout(dlg2d)
+            fig2d, ax2d = plt.subplots()
+            ax2d.set_aspect('equal')
+            ax2d.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], s=4)
+            circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
+            ax2d.add_patch(circle)
+            ax2d.set_title("Calibrated XY Plane Projection")
+            canvas2d = FigureCanvas2D(fig2d)
+            layout.addWidget(canvas2d)
+            dlg2d.setLayout(layout)
+            dlg2d.exec_()
+
+            dlg.exec_()
         except Exception as e:
             QMessageBox.critical(self.window, "Error", str(e))
 

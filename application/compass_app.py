@@ -460,6 +460,7 @@ class CalibrationApp(QObject):
         dlg2d.setLayout(layout)
         dlg2d.exec_()
 
+# ... existing code ...
     @pyqtSlot()
     def on_algo3d(self):
         fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
@@ -551,8 +552,70 @@ class CalibrationApp(QObject):
             dlg2d.exec_()
 
             dlg.exec_()
+            
+            # 显示第一步数据校准后的XY图
+            self.show_step0_calibrated_xy_from_algo(b, A, raw)
         except Exception as e:
             QMessageBox.critical(self.window, "Error", str(e))
+
+    def show_step0_calibrated_xy_from_algo(self, b, A, raw_data):
+        """显示算法处理后第一步数据的XY图"""
+        # 获取第一步数据（前1/3的数据）
+        n = len(raw_data)
+        k = n // 3
+        step0_data = raw_data[:k, :3]  # 只取前1/3的数据和前3列（mx, my, mz）
+        
+        # 应用校准算法到第一步数据
+        pts_cal_unit = ellipsoid_to_sphere(step0_data, b, A)
+        cal_mx = pts_cal_unit[:, 0]
+        cal_my = pts_cal_unit[:, 1]
+        
+        # 创建新的对话框显示第一步校准后的XY图
+        dlg_xy = QDialog(self.window)
+        dlg_xy.setWindowTitle("Step 0 Calibrated XY Data")
+        dlg_xy.resize(600, 500)
+        layout = QVBoxLayout(dlg_xy)
+        
+        fig_xy, ax_xy = plt.subplots(figsize=(8, 8))
+        ax_xy.set_aspect('equal')
+        
+        # 绘制校准后的数据点
+        ax_xy.scatter(cal_mx, cal_my, s=8, c='blue', alpha=0.7, label='Step 0 Calibrated Data')
+        
+        # 绘制参考单位圆
+        circle = plt.Circle((0, 0), 1, color='red', fill=False, linestyle='--', linewidth=2, label='Unit Circle')
+        ax_xy.add_patch(circle)
+        
+        # 绘制原点
+        ax_xy.plot(0, 0, 'k+', markersize=10, markeredgewidth=2, label='Origin')
+        
+        # 设置标题和标签
+        ax_xy.set_title("Step 0 Data After Ellipsoid Calibration - XY Projection")
+        ax_xy.set_xlabel("Calibrated MX")
+        ax_xy.set_ylabel("Calibrated MY")
+        ax_xy.grid(True, alpha=0.3)
+        ax_xy.legend()
+        
+        # 计算并显示统计数据
+        distances = np.sqrt(cal_mx**2 + cal_my**2)
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        
+        # 计算圆度误差（标准差/均值）
+        circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
+        
+        stats_text = f'Statistics:\n' \
+                    f'  Mean distance: {mean_dist:.4f}\n' \
+                    f'  Std deviation: {std_dist:.4f}\n' \
+                    f'  Circularity error: {circularity_error:.4f}'
+        ax_xy.text(0.02, 0.98, stats_text, transform=ax_xy.transAxes, 
+                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        canvas_xy = FigureCanvas2D(fig_xy)
+        layout.addWidget(canvas_xy)
+        dlg_xy.setLayout(layout)
+        dlg_xy.exec_()
+# ... existing code ...
 
     def run(self):
         self.window.show()

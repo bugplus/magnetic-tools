@@ -89,19 +89,35 @@ def fit_ellipsoid_3d(points):
     pts = np.asarray(points, dtype=float)[:, :3]
     if pts.shape[0] < 10:
         return None, None
-    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    # 1. 中心化
+    mean = np.mean(pts, axis=0)
+    pts_centered = pts - mean
+
+    # 2. 归一化尺度：防止病态
+    scale = np.std(pts_centered, axis=0)
+    pts_norm = pts_centered / scale
+
+    # 3. 椭球拟合（10 参数）
+    x, y, z = pts_norm.T
     D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
-    lam = 1e-6 * np.trace(D.T @ D) / D.shape[1]
-    coeffs = np.linalg.solve(D.T @ D + lam * np.eye(10), D.T @ np.ones_like(x))
+    reg = 1e-3 * np.trace(D.T @ D) / D.shape[0]
+    coeffs = np.linalg.solve(D.T @ D + reg * np.eye(10), D.T @ np.ones_like(x))
+
     Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
     Q = np.array([[Aq, Dq/2, Eq/2], [Dq/2, Bq, Fq/2], [Eq/2, Fq/2, Cq]])
-    eig_vals, eig_vecs = np.linalg.eigh(Q)
-    eig_vals = np.maximum(eig_vals, 1e-6)
-    b = -np.linalg.solve(Q, [G, H, I]) / 2
-    A_cal = eig_vecs @ np.diag(np.sqrt(eig_vals)) @ eig_vecs.T
-    if np.linalg.det(A_cal) < 0:
-        A_cal = -A_cal
-    return b, A_cal
+    b_norm = -np.linalg.solve(Q, [G, H, I]) / 2
+
+    # 4. 反归一化
+    b = b_norm * scale + mean
+
+    # 5. 软铁矩阵：正交化 + 行列式=1
+    U, S, Vt = np.linalg.svd(Q)
+    A_raw = Vt.T @ np.diag(1.0 / np.sqrt(S)) @ Vt
+    A = A_raw / np.cbrt(np.linalg.det(A_raw))
+    if np.linalg.det(A) < 0:
+        A = -A
+    return b, A
 
 def generate_c_code_3d(b, A):
     if b is None or A is None:
@@ -127,9 +143,9 @@ def raw_to_unit(raw_xyz, b):
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     centered = raw_xyz[:, :3] - b
-    sphere = centered @ A
+    sphere = centered @ np.linalg.inv(A)
     norm = np.linalg.norm(sphere, axis=1, keepdims=True)
-    norm[norm == 0] = 1
+    norm = np.where(norm < 1e-6, 1, norm)
     return sphere / norm
 
 def draw_unit_sphere(ax, r=1.0):

@@ -161,6 +161,8 @@ def draw_unit_sphere(ax, r=1.0):
 # -----------------------------
 # 3. CalibrationApp
 # -----------------------------
+# ... existing code until class CalibrationApp starts ...
+
 class CalibrationApp(QObject):
     def __init__(self):
         super().__init__()
@@ -201,6 +203,9 @@ class CalibrationApp(QObject):
         self.timer.timeout.connect(self._update_3d_plot_safe)
         self.timer.start(50)
 
+        # ====== 新增：记录每步数据的格子信息 ======
+        self.step_grid_info = [[], [], []]  # 为每步存储格子信息
+
         # 按钮信号
         self.window.step0_btn.clicked.connect(lambda: self.start_step(0))
         self.window.step1_btn.clicked.connect(lambda: self.start_step(1))
@@ -212,11 +217,6 @@ class CalibrationApp(QObject):
         self.current_step = 0
         self.check_timer = None
         self.step_start_idx = [0, 0, 0]
-
-    @pyqtSlot(float, float, float, float, float, float)
-    def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
-        if self.freeze_data is None:
-            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw])
 
     def _update_3d_plot_safe(self):
         if self.freeze_data is not None:
@@ -231,6 +231,21 @@ class CalibrationApp(QObject):
         self.ax3d.set_title(f"Raw 3D Mag ({len(xyz)} pts)")
         self.canvas3d.draw()
 
+    @pyqtSlot(float, float, float, float, float, float)
+    def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
+        if self.freeze_data is None:
+            # 计算水平面的角度（yaw）
+            horizontal_yaw = yaw
+            if horizontal_yaw < 0:
+                horizontal_yaw += 360
+                
+            # 计算格子编号（每10度一个格子）
+            grid_size = 10
+            grid_index = int(horizontal_yaw // grid_size)
+            grid_index = grid_index % 36  # 确保在0-35范围内
+            
+            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw, grid_index])
+
     def start_step(self, step: int):
         """自动判断数据质量后进入下一步"""
         port = self.window.port_combo.currentText()
@@ -244,6 +259,9 @@ class CalibrationApp(QObject):
 
         # 记录本步骤起始索引
         self.step_start_idx[step] = len(self.mag3d_data)
+        
+        # 清空当前步骤的格子信息
+        self.step_grid_info[step] = []
 
         if step == 0:
             # 仅 Step 0 清空全局数据
@@ -316,6 +334,7 @@ class CalibrationApp(QObject):
                 self.window.set_status(f"Step {step + 1} ✓  准备 Step {step + 2}")
             else:
                 self.finish_steps()
+                
     def reset_calibration(self):
         if self.check_timer is not None:
             self.check_timer.stop()
@@ -459,8 +478,163 @@ class CalibrationApp(QObject):
         layout.addWidget(canvas2d)
         dlg2d.setLayout(layout)
         dlg2d.exec_()
+        
+        # 显示第一步数据校准前后的XY图，按格子编号着色
+        self.show_step0_calibrated_xy_with_grid()
 
-# ... existing code ...
+    def show_step0_calibrated_xy_with_grid(self):
+        """显示第一步采集数据校准前后的XY图，按格子编号着色"""
+        if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
+            return
+            
+        # 获取第一步数据（前1/3的数据）
+        xyz = np.array(self.freeze_data)[:, :3]
+        grid_indices = np.array(self.freeze_data)[:, -1].astype(int)  # 获取格子编号
+        n = len(xyz)
+        k = n // 3
+        step0_data = xyz[:k]  # 第一步的数据
+        step0_grids = grid_indices[:k]  # 第一步的格子编号
+        
+        # 原始数据
+        mx_raw = step0_data[:, 0]
+        my_raw = step0_data[:, 1]
+        
+        # 应用完整校准算法（硬铁+软铁校准）
+        # 1. 硬铁校正
+        pts_centered = step0_data - self.freeze_b
+        # 2. 软铁校正
+        pts_cal = (self.freeze_A @ pts_centered.T).T
+        # 3. 归一化到单位球
+        norm = np.linalg.norm(pts_cal, axis=1, keepdims=True)
+        norm = np.where(norm < 1e-6, 1, norm)  # 防止除零
+        pts_cal_unit = pts_cal / norm
+        
+        cal_mx = pts_cal_unit[:, 0]
+        cal_my = pts_cal_unit[:, 1]
+        
+        # 创建新的对话框显示第一步校准前后的XY图对比
+        dlg_xy = QDialog(self.window)
+        dlg_xy.setWindowTitle("Step 0 Data Distribution - Before and After Calibration (Grid Labels)")
+        dlg_xy.resize(1200, 600)
+        layout = QVBoxLayout(dlg_xy)
+        
+        fig_xy, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        # 校准前的XY图，按格子编号标记
+        scatter1 = ax1.scatter(mx_raw, my_raw, s=20, c=step0_grids, cmap='hsv', alpha=0.7)
+        circle1 = plt.Circle((0, 0), 1, color='black', fill=False, linestyle='--', linewidth=1)
+        ax1.add_patch(circle1)
+        ax1.set_aspect('equal')
+        ax1.set_title("Step 0 Raw Data Distribution\n(Numbered by 10° Grid)")
+        ax1.set_xlabel("Raw MX")
+        ax1.set_ylabel("Raw MY")
+        ax1.grid(True, alpha=0.3)
+        
+        # 添加颜色条
+        cbar1 = plt.colorbar(scatter1, ax=ax1, shrink=0.8)
+        cbar1.set_label('Grid Index (0-35)')
+        
+        # 校准后的XY图，按格子编号标记
+        scatter2 = ax2.scatter(cal_mx, cal_my, s=20, c=step0_grids, cmap='hsv', alpha=0.7)
+        circle2 = plt.Circle((0, 0), 1, color='black', fill=False, linestyle='--', linewidth=1)
+        ax2.add_patch(circle2)
+        ax2.set_aspect('equal')
+        ax2.set_title("Step 0 Calibrated Data Distribution\n(Numbered by 10° Grid)")
+        ax2.set_xlabel("Calibrated MX")
+        ax2.set_ylabel("Calibrated MY")
+        ax2.grid(True, alpha=0.3)
+        
+        # 添加颜色条
+        cbar2 = plt.colorbar(scatter2, ax=ax2, shrink=0.8)
+        cbar2.set_label('Grid Index (0-35)')
+        
+        # 计算并显示统计数据
+        # 校准前的统计
+        distances_raw = np.sqrt(mx_raw**2 + my_raw**2)
+        mean_dist_raw = np.mean(distances_raw)
+        std_dist_raw = np.std(distances_raw)
+        
+        # 校准后的统计
+        distances_cal = np.sqrt(cal_mx**2 + cal_my**2)
+        mean_dist_cal = np.mean(distances_cal)
+        std_dist_cal = np.std(distances_cal)
+        
+        # 计算格子覆盖情况
+        unique_grids = np.unique(step0_grids)
+        coverage = len(unique_grids) / 36.0 * 100  # 36个格子(0-35)
+        
+        stats_text = f'Statistics:\n' \
+                    f'  Raw - Mean distance: {mean_dist_raw:.4f}, Std: {std_dist_raw:.4f}\n' \
+                    f'  Calibrated - Mean distance: {mean_dist_cal:.4f}, Std: {std_dist_cal:.4f}\n' \
+                    f'  Grid Coverage: {len(unique_grids)}/36 ({coverage:.1f}%)'
+        fig_xy.suptitle(stats_text, fontsize=12)
+        
+        plt.tight_layout()
+        
+        canvas_xy = FigureCanvas2D(fig_xy)
+        layout.addWidget(canvas_xy)
+        dlg_xy.setLayout(layout)
+        dlg_xy.exec_()
+        
+        # 额外显示角度分布直方图
+        self.show_step0_angle_distribution_histogram(step0_data, step0_grids)
+
+    def show_step0_angle_distribution_histogram(self, step0_data, step0_grids):
+        """显示第一步数据的角度分布直方图"""
+        # 计算原始角度
+        mx_raw = step0_data[:, 0]
+        my_raw = step0_data[:, 1]
+        angles_raw = np.arctan2(my_raw, mx_raw)
+        angles_deg_raw = np.degrees(angles_raw)
+        angles_deg_raw = np.where(angles_deg_raw < 0, angles_deg_raw + 360, angles_deg_raw)
+        
+        # 计算校准后角度
+        pts_centered = step0_data - self.freeze_b
+        pts_cal = (self.freeze_A @ pts_centered.T).T
+        norm = np.linalg.norm(pts_cal, axis=1, keepdims=True)
+        norm = np.where(norm < 1e-6, 1, norm)
+        pts_cal_unit = pts_cal / norm
+        cal_mx = pts_cal_unit[:, 0]
+        cal_my = pts_cal_unit[:, 1]
+        angles_cal = np.arctan2(cal_my, cal_mx)
+        angles_deg_cal = np.degrees(angles_cal)
+        angles_deg_cal = np.where(angles_deg_cal < 0, angles_deg_cal + 360, angles_deg_cal)
+        
+        dlg_hist = QDialog(self.window)
+        dlg_hist.setWindowTitle("Step 0 Angle Distribution Histogram - Before and After Calibration")
+        dlg_hist.resize(1000, 400)
+        layout = QVBoxLayout(dlg_hist)
+        
+        fig_hist, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # 校准前的角度分布直方图
+        ax1.hist(angles_deg_raw, bins=36, range=(0, 360), alpha=0.7, color='blue', edgecolor='black')
+        ax1.set_title("Raw Data Angle Distribution")
+        ax1.set_xlabel("Angle (degrees)")
+        ax1.set_ylabel("Count")
+        ax1.grid(True, alpha=0.3)
+        
+        # 校准后的角度分布直方图
+        ax2.hist(angles_deg_cal, bins=36, range=(0, 360), alpha=0.7, color='green', edgecolor='black')
+        ax2.set_title("Calibrated Data Angle Distribution")
+        ax2.set_xlabel("Angle (degrees)")
+        ax2.set_ylabel("Count")
+        ax2.grid(True, alpha=0.3)
+        
+        # 按格子编号的分布
+        ax3.hist(step0_grids, bins=36, range=(0, 36), alpha=0.7, color='red', edgecolor='black')
+        ax3.set_title("Data Distribution by Grid Index")
+        ax3.set_xlabel("Grid Index (0-35)")
+        ax3.set_ylabel("Count")
+        ax3.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        canvas_hist = FigureCanvas2D(fig_hist)
+        layout.addWidget(canvas_hist)
+        dlg_hist.setLayout(layout)
+        dlg_hist.exec_()
+
     @pyqtSlot()
     def on_algo3d(self):
         fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
@@ -615,7 +789,6 @@ class CalibrationApp(QObject):
         layout.addWidget(canvas_xy)
         dlg_xy.setLayout(layout)
         dlg_xy.exec_()
-# ... existing code ...
 
     def run(self):
         self.window.show()

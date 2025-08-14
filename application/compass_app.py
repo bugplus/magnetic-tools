@@ -111,12 +111,12 @@ def fit_ellipsoid_3d(points):
     # 4. 反归一化
     b = b_norm * scale + mean
 
-    # 5. 软铁矩阵：正交化 + 行列式=1
     U, S, Vt = np.linalg.svd(Q)
-    A_raw = Vt.T @ np.diag(1.0 / np.sqrt(S)) @ Vt
-    A = A_raw / np.cbrt(np.linalg.det(A_raw))
-    if np.linalg.det(A) < 0:
-        A = -A
+    scale = 1.0 / np.sqrt(np.maximum(S, 1e-12))
+    A_raw = Vt.T @ np.diag(scale) @ Vt
+    det = np.linalg.det(A_raw)
+    A_raw = A_raw * np.sign(det)
+    A = A_raw / np.linalg.norm(A_raw, ord='fro')   # ← 关键：用 Frobenius 范数归一
     return b, A
 
 def generate_c_code_3d(b, A):
@@ -146,7 +146,10 @@ def ellipsoid_to_sphere(raw_xyz, b, A):
     sphere = centered @ np.linalg.inv(A)
     norm = np.linalg.norm(sphere, axis=1, keepdims=True)
     norm = np.where(norm < 1e-6, 1, norm)
-    return sphere / norm
+    sphere = sphere / norm
+    avg = np.mean(np.linalg.norm(sphere, axis=1))   # 新增
+    sphere = sphere / (avg + 1e-12)                 # 新增
+    return sphere
 
 def draw_unit_sphere(ax, r=1.0):
     u = np.linspace(0, 2 * np.pi, 60)

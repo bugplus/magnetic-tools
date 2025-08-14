@@ -479,7 +479,7 @@ class CalibrationApp(QObject):
         # 显示第一步数据校准前后的XY图，按格子编号着色
         self.show_step0_calibrated_xy_with_grid()
 
-    def show_step0_calibrated_xy_with_grid(self):
+    def show_step0_angle_distribution_histogram(self, step0_data, step0_grids):
         """显示第一步采集数据校准前后的XY图，按90°分段着色"""
         if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
             return
@@ -592,14 +592,14 @@ class CalibrationApp(QObject):
         fig_hist, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
         
         # 校准前的角度分布直方图
-        ax1.hist(step0_yaw, bins=36, range=(0, 360), ...)
+        ax1.hist(step0_yaw, bins=36, range=(0, 360), edgecolor='black')
         ax1.set_title("Raw Data Angle Distribution")
         ax1.set_xlabel("Angle (degrees)")
         ax1.set_ylabel("Count")
         ax1.grid(True, alpha=0.3)
         
         # 校准后的角度分布直方图
-        ax2.hist(step0_yaw, bins=36, range=(0, 360), ...)
+        ax2.hist(angles_deg_cal, bins=36, range=(0, 360), edgecolor='black')
         ax2.set_title("Calibrated Data Angle Distribution")
         ax2.set_xlabel("Angle (degrees)")
         ax2.set_ylabel("Count")
@@ -646,7 +646,7 @@ class CalibrationApp(QObject):
             pts_raw_unit = raw_to_unit(raw, b)
             pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
 
-        # ... 后续代码保持不变 ...
+            # ... 后续代码保持不变 ...
 
             n = len(pts_raw_unit)
             k = n // 3
@@ -687,38 +687,43 @@ class CalibrationApp(QObject):
             FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
             FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
 
-            # XY 平面图（模态）
-            dlg2d = QDialog(self.window)
-            dlg2d.setWindowTitle("Calibrated XY Projection")
-            dlg2d.resize(450, 450)
-            layout = QVBoxLayout(dlg2d)
-            fig2d, ax2d = plt.subplots()
-            ax2d.set_aspect('equal')
+            # === 第一步完整数据 ===
+            step0_data = raw[:len(raw)//3, :3]          # 第一步全部磁数据
+            yaws_step0 = raw[:len(raw)//3, 5]          # 对应 yaw
 
-            # 获取航偏角（假设航偏角在 raw 的最后一位）
-            yaws = raw[:, -1]
+            # 校准后单位圆坐标
+            pts_step0_unit = ellipsoid_to_sphere(step0_data, b, A)
 
-            # 根据 yaw 角划分颜色
-            color_map = {
-                (0, 90): 'r',   # 第一象限
-                (90, 180): 'g', # 第二象限
-                (180, 270): 'b',# 第三象限
-                (270, 360): 'm' # 第四象限
-            }
+            color_map = {(0, 90): 'r', (90, 180): 'g', (180, 270): 'b', (270, 360): 'y'}
 
-            for (start, end), color in color_map.items():
-                mask = ((yaws >= start) & (yaws < end)) | ((yaws + 360 >= start) & (yaws + 360 < end))
-                ax2d.scatter(pts_cal_unit[mask, 0], pts_cal_unit[mask, 1], s=4, c=color, label=f'{start}-{end} deg')
+            dlg_compare = QDialog(self.window)
+            dlg_compare.setWindowTitle("Step0 XY: Raw vs Calibrated")
+            dlg_compare.resize(900, 450)
+            layout = QVBoxLayout(dlg_compare)
+            fig_compare, (ax_raw, ax_cal) = plt.subplots(1, 2, figsize=(12, 5))
 
-            circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
-            ax2d.add_patch(circle)
-            ax2d.set_title("Calibrated XY Plane Projection")
-            ax2d.legend()
+            # Raw XY（按角度着色）
+            for (s, e), c in color_map.items():
+                m = ((yaws_step0 >= s) & (yaws_step0 < e)) | ((yaws_step0 + 360 >= s) & (yaws_step0 + 360 < e))
+                ax_raw.scatter(step0_data[m, 0], step0_data[m, 1],
+                            s=4, c=c, label=f'{s}-{e} deg', alpha=0.7)
 
-            canvas2d = FigureCanvas2D(fig2d)
-            layout.addWidget(canvas2d)
-            dlg2d.setLayout(layout)
-            dlg2d.exec_()
+            ax_raw.set_title("Raw XY (Step0 Full)")
+            ax_raw.set_aspect('equal'); ax_raw.grid(alpha=0.3); ax_raw.legend()
+
+            # Calibrated XY
+            for (s, e), c in color_map.items():
+                m = ((yaws_step0 >= s) & (yaws_step0 < e)) | ((yaws_step0 + 360 >= s) & (yaws_step0 + 360 < e))
+                ax_cal.scatter(pts_step0_unit[m, 0], pts_step0_unit[m, 1],
+                            s=4, c=c, label=f'{s}-{e} deg', alpha=0.7)
+            ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
+            ax_cal.set_title("Calibrated XY (Step0 Full)")
+            ax_cal.set_aspect('equal'); ax_cal.legend(); ax_cal.grid(alpha=0.3)
+
+            plt.tight_layout()
+            layout.addWidget(FigureCanvas2D(fig_compare))
+            dlg_compare.setLayout(layout)
+            dlg_compare.exec_()
 
             dlg.exec_()
             
@@ -742,7 +747,6 @@ class CalibrationApp(QObject):
         
         # 计算角度用于着色
         yaws_step0 = raw_data[:k, 5]
-        angles_deg = np.degrees(angles)
         angles_deg = np.where(angles_deg < 0, angles_deg + 360, angles_deg)
         
         # 创建新的对话框显示第一步校准后的XY图

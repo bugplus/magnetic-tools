@@ -641,10 +641,19 @@ class CalibrationApp(QObject):
         if not fname:
             return
         try:
-            raw = np.loadtxt(fname, delimiter=',', ndmin=2)
-            if raw.shape[1] not in (3, 6):
-                raise ValueError("CSV must be N×3 or N×6")
+            # 读取所有列
+            raw_all = np.loadtxt(fname, delimiter=',', ndmin=2)
+            
+            # 检查列数是否为 3, 6, 或 7
+            if raw_all.shape[1] not in (3, 6, 7):
+                raise ValueError("CSV must be N×3, N×6, or N×7")
 
+            # 如果是 7 列，提取前 6 列（mx, my, mz, pitch, roll, yaw）
+            if raw_all.shape[1] == 7:
+                raw = raw_all[:, :6]
+            else:
+                raw = raw_all  # 3列或6列的情况
+            
             b, A = fit_ellipsoid_3d(raw)
             if b is None or A is None:
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
@@ -652,6 +661,8 @@ class CalibrationApp(QObject):
 
             pts_raw_unit = raw_to_unit(raw, b)
             pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
+
+        # ... 后续代码保持不变 ...
 
             n = len(pts_raw_unit)
             k = n // 3
@@ -732,6 +743,7 @@ class CalibrationApp(QObject):
         except Exception as e:
             QMessageBox.critical(self.window, "Error", str(e))
 
+
     def show_step0_calibrated_xy_from_algo(self, b, A, raw_data):
         """显示算法处理后第一步数据的XY图"""
         # 获取第一步数据（前1/3的数据）
@@ -744,6 +756,11 @@ class CalibrationApp(QObject):
         cal_mx = pts_cal_unit[:, 0]
         cal_my = pts_cal_unit[:, 1]
         
+        # 计算角度用于着色
+        angles = np.arctan2(cal_my, cal_mx)
+        angles_deg = np.degrees(angles)
+        angles_deg = np.where(angles_deg < 0, angles_deg + 360, angles_deg)
+        
         # 创建新的对话框显示第一步校准后的XY图
         dlg_xy = QDialog(self.window)
         dlg_xy.setWindowTitle("Step 0 Calibrated XY Data")
@@ -753,15 +770,24 @@ class CalibrationApp(QObject):
         fig_xy, ax_xy = plt.subplots(figsize=(8, 8))
         ax_xy.set_aspect('equal')
         
-        # 绘制校准后的数据点
-        ax_xy.scatter(cal_mx, cal_my, s=8, c='blue', alpha=0.7, label='Step 0 Calibrated Data')
+        # 根据角度着色，每90度一个颜色
+        colors_map = {
+            (0, 90): 'red',
+            (90, 180): 'green', 
+            (180, 270): 'blue',
+            (270, 360): 'orange'
+        }
+        
+        for (start, end), color in colors_map.items():
+            mask = (angles_deg >= start) & (angles_deg < end)
+            ax_xy.scatter(cal_mx[mask], cal_my[mask], s=8, c=color, alpha=0.7, label=f'{start}°-{end}°')
         
         # 绘制参考单位圆
-        circle = plt.Circle((0, 0), 1, color='red', fill=False, linestyle='--', linewidth=2, label='Unit Circle')
+        circle = plt.Circle((0, 0), 1, color='red', fill=False, linestyle='--', linewidth=2)
         ax_xy.add_patch(circle)
         
         # 绘制原点
-        ax_xy.plot(0, 0, 'k+', markersize=10, markeredgewidth=2, label='Origin')
+        ax_xy.plot(0, 0, 'k+', markersize=10, markeredgewidth=2)
         
         # 设置标题和标签
         ax_xy.set_title("Step 0 Data After Ellipsoid Calibration - XY Projection")

@@ -122,6 +122,7 @@ def fit_ellipsoid_3d(points):
 def generate_c_code_3d(b, A):
     if b is None or A is None:
         return "/* Error: Calibration failed */"
+    
     bx, by, bz = b
     A = np.linalg.inv(A)
     lines = [
@@ -143,14 +144,13 @@ def raw_to_unit(raw_xyz, b):
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
     centered = raw_xyz[:, :3] - b
-    sphere = centered @ np.linalg.inv(A)
+    # ↓ 只加这一行，防病态，不影响外部
+    safe_scale = max(np.abs(centered).max(), 1e-6)
+    sphere = (centered / safe_scale) @ np.linalg.inv(A * safe_scale)
     norm = np.linalg.norm(sphere, axis=1, keepdims=True)
     norm = np.where(norm < 1e-6, 1, norm)
     sphere = sphere / norm
-    avg = np.mean(np.linalg.norm(sphere, axis=1))   # 新增
-    sphere = sphere / (avg + 1e-12)                 # 新增
     return sphere
-
 def draw_unit_sphere(ax, r=1.0):
     u = np.linspace(0, 2 * np.pi, 60)
     v = np.linspace(0, np.pi, 30)
@@ -237,16 +237,10 @@ class CalibrationApp(QObject):
     @pyqtSlot(float, float, float, float, float, float)
     def handle_new_data(self, mx, my, mz, pitch, roll, yaw):
         if self.freeze_data is None:
-            # 计算水平面的角度（yaw）
-            horizontal_yaw = yaw
-            if horizontal_yaw < 0:
-                horizontal_yaw += 360
-                
-            # 计算格子编号（每10度一个格子）
-            grid_size = 10
-            grid_index = int(horizontal_yaw // grid_size)
-            grid_index = grid_index % 36  # 确保在0-35范围内
-            
+            angle_deg = yaw
+            if angle_deg < 0:
+                angle_deg += 360
+            grid_index = int(angle_deg // 10) % 36
             self.mag3d_data.append([mx, my, mz, pitch, roll, yaw, grid_index])
 
     def start_step(self, step: int):
@@ -457,8 +451,8 @@ class CalibrationApp(QObject):
         fig2d, ax2d = plt.subplots()
         ax2d.set_aspect('equal')
 
-        # 获取航偏角（假设航偏角在 freeze_data 的最后一位）
-        yaws = np.array(self.freeze_data)[:, -1]
+        # 直接使用下位机 yaw
+        yaws = np.array(self.freeze_data)[:, 5]   # 第5列就是 yaw
 
         # 根据 yaw 角划分颜色
         color_map = {
@@ -486,94 +480,84 @@ class CalibrationApp(QObject):
         self.show_step0_calibrated_xy_with_grid()
 
     def show_step0_calibrated_xy_with_grid(self):
-        """显示第一步采集数据校准前后的XY图，按格子编号着色"""
+        """显示第一步采集数据校准前后的XY图，按90°分段着色"""
         if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
             return
-            
-        # 获取第一步数据（前1/3的数据）
-        xyz = np.array(self.freeze_data)[:, :3]
-        grid_indices = np.array(self.freeze_data)[:, -1].astype(int)  # 获取格子编号
-        n = len(xyz)
-        k = n // 3
-        step0_data = xyz[:k]  # 第一步的数据
-        step0_grids = grid_indices[:k]  # 第一步的格子编号
-        
-        # 原始数据
+
+        # 仅取第一步数据
+        step0_data = np.array(self.freeze_data)[
+            self.step_start_idx[0]:self.step_start_idx[1], :3
+        ]
         mx_raw = step0_data[:, 0]
         my_raw = step0_data[:, 1]
-        
-        # 应用完整校准算法（硬铁+软铁校准）
-        # 1. 硬铁校正
+
+        # 硬铁 + 软铁校准
         pts_centered = step0_data - self.freeze_b
-        # 2. 软铁校正
         pts_cal = (self.freeze_A @ pts_centered.T).T
-        # 3. 归一化到单位球
         norm = np.linalg.norm(pts_cal, axis=1, keepdims=True)
-        norm = np.where(norm < 1e-6, 1, norm)  # 防止除零
+        norm = np.where(norm < 1e-6, 1, norm)
         pts_cal_unit = pts_cal / norm
-        
         cal_mx = pts_cal_unit[:, 0]
         cal_my = pts_cal_unit[:, 1]
-        
-        # 创建新的对话框显示第一步校准前后的XY图对比
+
+        # 直接用 step0 的 yaw 值着色
+        step0_yaw = np.array(self.freeze_data)[
+            self.step_start_idx[0]:self.step_start_idx[1], 5
+        ]
+        def angle_color(yaw_vals):
+            colors = np.empty_like(yaw_vals, dtype=object)
+            colors[(yaw_vals >= 0)   & (yaw_vals < 90)]  = 'red'
+            colors[(yaw_vals >= 90)  & (yaw_vals < 180)] = 'green'
+            colors[(yaw_vals >= 180) & (yaw_vals < 270)] = 'blue'
+            colors[(yaw_vals >= 270) & (yaw_vals < 360)] = 'orange'
+            return colors
+        colors_raw = angle_color(step0_yaw)
+        colors_cal = angle_color(step0_yaw)   # 同一套 yaw
+
+        # 绘制
         dlg_xy = QDialog(self.window)
-        dlg_xy.setWindowTitle("Step 0 Data Distribution - Before and After Calibration (Grid Labels)")
+        dlg_xy.setWindowTitle("Step 0 XY Projection (90° Segments)")
         dlg_xy.resize(1200, 600)
         layout = QVBoxLayout(dlg_xy)
-        
+
         fig_xy, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-        
-        # 校准前的XY图，按格子编号标记
-        scatter1 = ax1.scatter(mx_raw, my_raw, s=20, c=step0_grids, cmap='hsv', alpha=0.7)
-        circle1 = plt.Circle((0, 0), 1, color='black', fill=False, linestyle='--', linewidth=1)
-        ax1.add_patch(circle1)
+
+        # 原始
+        ax1.scatter(mx_raw, my_raw, s=20, c=colors_raw, alpha=0.7)
+        ax1.add_patch(plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1))
+        ax1.plot(0, 0, 'k+', markersize=12, markeredgewidth=2)  # ← 加这句
+        ax1.axhline(0, color='black', linewidth=1.5)
+        ax1.axvline(0, color='black', linewidth=1.5)
+
         ax1.set_aspect('equal')
-        ax1.set_title("Step 0 Raw Data Distribution\n(Numbered by 10° Grid)")
+        ax1.set_title("Step 0 Raw Data (90° Segments)")
         ax1.set_xlabel("Raw MX")
         ax1.set_ylabel("Raw MY")
         ax1.grid(True, alpha=0.3)
-        
-        # 添加颜色条
-        cbar1 = plt.colorbar(scatter1, ax=ax1, shrink=0.8)
-        cbar1.set_label('Grid Index (0-35)')
-        
-        # 校准后的XY图，按格子编号标记
-        scatter2 = ax2.scatter(cal_mx, cal_my, s=20, c=step0_grids, cmap='hsv', alpha=0.7)
-        circle2 = plt.Circle((0, 0), 1, color='black', fill=False, linestyle='--', linewidth=1)
-        ax2.add_patch(circle2)
+
+        # 校准后
+        ax2.scatter(cal_mx, cal_my, s=20, c=colors_cal, alpha=0.7)
+        ax2.add_patch(plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1))
+        ax2.plot(0, 0, 'k+', markersize=12, markeredgewidth=2)  # ← 加这句
+        ax2.axhline(0, color='black', linewidth=1.5)
+        ax2.axvline(0, color='black', linewidth=1.5)
+
         ax2.set_aspect('equal')
-        ax2.set_title("Step 0 Calibrated Data Distribution\n(Numbered by 10° Grid)")
+        ax2.set_title("Step 0 Calibrated Data (90° Segments)")
         ax2.set_xlabel("Calibrated MX")
         ax2.set_ylabel("Calibrated MY")
         ax2.grid(True, alpha=0.3)
-        
-        # 添加颜色条
-        cbar2 = plt.colorbar(scatter2, ax=ax2, shrink=0.8)
-        cbar2.set_label('Grid Index (0-35)')
-        
-        # 计算并显示统计数据
-        # 校准前的统计
+
+        # 统计
         distances_raw = np.sqrt(mx_raw**2 + my_raw**2)
-        mean_dist_raw = np.mean(distances_raw)
-        std_dist_raw = np.std(distances_raw)
-        
-        # 校准后的统计
         distances_cal = np.sqrt(cal_mx**2 + cal_my**2)
-        mean_dist_cal = np.mean(distances_cal)
-        std_dist_cal = np.std(distances_cal)
-        
-        # 计算格子覆盖情况
-        unique_grids = np.unique(step0_grids)
-        coverage = len(unique_grids) / 36.0 * 100  # 36个格子(0-35)
-        
-        stats_text = f'Statistics:\n' \
-                    f'  Raw - Mean distance: {mean_dist_raw:.4f}, Std: {std_dist_raw:.4f}\n' \
-                    f'  Calibrated - Mean distance: {mean_dist_cal:.4f}, Std: {std_dist_cal:.4f}\n' \
-                    f'  Grid Coverage: {len(unique_grids)}/36 ({coverage:.1f}%)'
-        fig_xy.suptitle(stats_text, fontsize=12)
-        
+        stats_txt = (
+            f"Raw:  Mean={np.mean(distances_raw):.3f}, Std={np.std(distances_raw):.3f}\n"
+            f"Cal:  Mean={np.mean(distances_cal):.3f}, Std={np.std(distances_cal):.3f}"
+        )
+        fig_xy.suptitle(stats_txt, fontsize=12)
+
         plt.tight_layout()
-        
         canvas_xy = FigureCanvas2D(fig_xy)
         layout.addWidget(canvas_xy)
         dlg_xy.setLayout(layout)
@@ -584,13 +568,10 @@ class CalibrationApp(QObject):
 
     def show_step0_angle_distribution_histogram(self, step0_data, step0_grids):
         """显示第一步数据的角度分布直方图"""
-        # 计算原始角度
-        mx_raw = step0_data[:, 0]
-        my_raw = step0_data[:, 1]
-        angles_raw = np.arctan2(my_raw, mx_raw)
-        angles_deg_raw = np.degrees(angles_raw)
-        angles_deg_raw = np.where(angles_deg_raw < 0, angles_deg_raw + 360, angles_deg_raw)
-        
+        # 直方图直接用 step0_yaw
+        step0_yaw = np.array(self.freeze_data)[
+            self.step_start_idx[0]:self.step_start_idx[1], 5
+        ]
         # 计算校准后角度
         pts_centered = step0_data - self.freeze_b
         pts_cal = (self.freeze_A @ pts_centered.T).T
@@ -611,14 +592,14 @@ class CalibrationApp(QObject):
         fig_hist, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
         
         # 校准前的角度分布直方图
-        ax1.hist(angles_deg_raw, bins=36, range=(0, 360), alpha=0.7, color='blue', edgecolor='black')
+        ax1.hist(step0_yaw, bins=36, range=(0, 360), ...)
         ax1.set_title("Raw Data Angle Distribution")
         ax1.set_xlabel("Angle (degrees)")
         ax1.set_ylabel("Count")
         ax1.grid(True, alpha=0.3)
         
         # 校准后的角度分布直方图
-        ax2.hist(angles_deg_cal, bins=36, range=(0, 360), alpha=0.7, color='green', edgecolor='black')
+        ax2.hist(step0_yaw, bins=36, range=(0, 360), ...)
         ax2.set_title("Calibrated Data Angle Distribution")
         ax2.set_xlabel("Angle (degrees)")
         ax2.set_ylabel("Count")
@@ -760,7 +741,7 @@ class CalibrationApp(QObject):
         cal_my = pts_cal_unit[:, 1]
         
         # 计算角度用于着色
-        angles = np.arctan2(cal_my, cal_mx)
+        yaws_step0 = raw_data[:k, 5]
         angles_deg = np.degrees(angles)
         angles_deg = np.where(angles_deg < 0, angles_deg + 360, angles_deg)
         
@@ -782,7 +763,8 @@ class CalibrationApp(QObject):
         }
         
         for (start, end), color in colors_map.items():
-            mask = (angles_deg >= start) & (angles_deg < end)
+            mask = ((yaws_step0 >= start) & (yaws_step0 < end)) | \
+                   ((yaws_step0 + 360 >= start) & (yaws_step0 + 360 < end))
             ax_xy.scatter(cal_mx[mask], cal_my[mask], s=8, c=color, alpha=0.7, label=f'{start}°-{end}°')
         
         # 绘制参考单位圆

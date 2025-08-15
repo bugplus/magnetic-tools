@@ -220,6 +220,17 @@ class CalibrationApp(QObject):
         self.current_step = 0
         self.check_timer = None
         self.step_start_idx = [0, 0, 0]
+                # ------------ 复用 config 的格点/角度/点数规则 -------------
+        self.NEED_PER_GRID = {
+            0: POINTS_PER_GRID,
+            1: POINTS_PER_GRID,
+            2: POINTS_PER_GRID
+        }
+        self.NEED_ANGLE_SPAN = {
+            0: AUTO_YAW_RANGE_MIN,
+            1: AUTO_PITCH_RANGE_MIN,
+            2: AUTO_ROLL_RANGE_MIN
+        }
 
     def _update_3d_plot_safe(self):
         if self.freeze_data is not None:
@@ -240,8 +251,9 @@ class CalibrationApp(QObject):
             angle_deg = yaw
             if angle_deg < 0:
                 angle_deg += 360
-            grid_index = int(angle_deg // 10) % 36
-            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw, grid_index])
+            grid_index = int(angle_deg // GRID_STEP_DEG) % (360 // GRID_STEP_DEG)
+            # ⭐ 直接带当前 step 编号
+            self.mag3d_data.append([mx, my, mz, pitch, roll, yaw, grid_index, self.current_step])
 
     def start_step(self, step: int):
         """自动判断数据质量后进入下一步"""
@@ -292,7 +304,10 @@ class CalibrationApp(QObject):
         pitch = data[:, 3]
         roll  = data[:, 4]
 
-        bins_yaw  = np.arange(0, 361, GRID_STEP_DEG)
+        # 复用 config 变量
+        need_per  = self.NEED_PER_GRID[step]
+        need_span = self.NEED_ANGLE_SPAN[step]
+        bins_yaw  = np.arange(0, AUTO_YAW_RANGE_MIN   + 1, GRID_STEP_DEG)
         bins_pr   = np.arange(-90, 91, GRID_STEP_DEG)
 
         cnt_yaw,   _ = np.histogram(yaw,   bins=bins_yaw)
@@ -300,24 +315,21 @@ class CalibrationApp(QObject):
         cnt_roll,  _ = np.histogram(roll,  bins=bins_pr)
 
         # 每轴满格判定
-        yaw_ok   = (cnt_yaw   >= POINTS_PER_GRID).all()
-        pitch_ok = (cnt_pitch >= POINTS_PER_GRID).all()
-        roll_ok  = (cnt_roll  >= POINTS_PER_GRID).all()
+        yaw_ok   = (cnt_yaw   >= need_per).all()
+        pitch_ok = (cnt_pitch >= need_per).all()
+        roll_ok  = (cnt_roll  >= need_per).all()
 
         # 只检查当前步骤需要的轴
-        if step == 0:      # Step 1 水平：只看 yaw
-            ok = yaw_ok
-        elif step == 1:    # Step 2 俯仰：只看 pitch
-            ok = pitch_ok
-        else:              # Step 3 横滚：只看 roll
-            ok = roll_ok
+        if step == 0:   ok = yaw_ok
+        elif step == 1: ok = pitch_ok
+        else:           ok = roll_ok
 
         # 状态提示
         self.window.set_status(
             f"Step {step+1} 运行中... "
-            f"yaw:{np.sum(cnt_yaw>=POINTS_PER_GRID)}/{len(bins_yaw)-1}  "
-            f"pitch:{np.sum(cnt_pitch>=POINTS_PER_GRID)}/{len(bins_pr)-1}  "
-            f"roll:{np.sum(cnt_roll>=POINTS_PER_GRID)}/{len(bins_pr)-1}"
+            f"yaw:{np.sum(cnt_yaw>=need_per)}/{len(bins_yaw)-1}  "
+            f"pitch:{np.sum(cnt_pitch>=need_per)}/{len(bins_pr)-1}  "
+            f"roll:{np.sum(cnt_roll>=need_per)}/{len(bins_pr)-1}"
         )
 
         # 满足 → 下一步
@@ -330,6 +342,8 @@ class CalibrationApp(QObject):
                 btn_list[step + 1].setEnabled(True)
                 self.window.set_status(f"Step {step + 1} ✓  准备 Step {step + 2}")
             else:
+                # 只在 Step 2 真正结束
+                self.freeze_data = list(self.mag3d_data)  # ← 先赋值
                 self.finish_steps()
                 
     def reset_calibration(self):
@@ -351,8 +365,8 @@ class CalibrationApp(QObject):
             self.check_timer.stop()
         if self.thread:
             self.thread.stop()
-        if len(self.mag3d_data) < MIN_3D_POINTS * 2:
-            self.window.set_status(f"3D Need ≥{MIN_3D_POINTS * 2}")
+        if len(self.freeze_data) < MIN_3D_POINTS:
+            self.window.set_status(f"Need ≥{MIN_3D_POINTS} points")
             return
 
         self.freeze_data = list(self.mag3d_data)
@@ -361,25 +375,23 @@ class CalibrationApp(QObject):
             self.window.set_status("3D Calibration failed")
             return
 
-        self.timer.stop()
+        # ---------- 1) 保存带 step_id 的 CSV ----------
+       # 新：直接取采集时记录的 step_id（第8列）
+        step_ids = np.array([row[-1] for row in self.freeze_data])
+        save_arr = np.hstack([np.array(self.freeze_data), step_ids.reshape(-1, 1)])
+        np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
+                   save_arr, delimiter=',', fmt='%.6f')
+
+        # ---------- 2) 其余不变 ----------
         xyz = np.array(self.freeze_data)[:, :3]
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
-
-        os.makedirs(CALIB_DIR, exist_ok=True)
-        np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"), pts_cal_unit, delimiter=',', fmt='%.8f')
-        np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"), np.array(self.freeze_data), delimiter=',', fmt='%.6f')
+        np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"),
+                   pts_cal_unit, delimiter=',', fmt='%.8f')
         c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
         with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
             f.write(c_code)
 
-        self.ax3d_cal.clear()
-        draw_unit_sphere(self.ax3d_cal, r=1.0)
-        self.ax3d_cal.scatter(pts_cal_unit[:, 0], pts_cal_unit[:, 1], pts_cal_unit[:, 2],
-                              c=np.linalg.norm(pts_cal_unit, axis=1), s=6, cmap='coolwarm', vmin=0.9, vmax=1.1)
-        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
-        self.ax3d_cal.set_box_aspect([1, 1, 1])
-        self.canvas3d_cal.draw()
-
+        self.timer.stop()
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
@@ -476,11 +488,11 @@ class CalibrationApp(QObject):
         dlg2d.setLayout(layout)
         dlg2d.exec_()
         
-        # 显示第一步数据校准前后的XY图，按格子编号着色
-        self.show_step0_calibrated_xy_with_grid()
+       # 额外显示角度分布直方图
+        self.show_step0_angle_distribution_histogram()
 
-    def show_step0_angle_distribution_histogram(self, step0_data, step0_grids):
-        """显示第一步采集数据校准前后的XY图，按90°分段着色"""
+    def show_step0_angle_distribution_histogram(self):
+        """显示第一步数据校准前后的XY图，按90°分段着色"""
         if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
             return
 
@@ -504,15 +516,19 @@ class CalibrationApp(QObject):
         step0_yaw = np.array(self.freeze_data)[
             self.step_start_idx[0]:self.step_start_idx[1], 5
         ]
-        def angle_color(yaw_vals):
-            colors = np.empty_like(yaw_vals, dtype=object)
-            colors[(yaw_vals >= 0)   & (yaw_vals < 90)]  = 'red'
-            colors[(yaw_vals >= 90)  & (yaw_vals < 180)] = 'green'
-            colors[(yaw_vals >= 180) & (yaw_vals < 270)] = 'blue'
-            colors[(yaw_vals >= 270) & (yaw_vals < 360)] = 'orange'
-            return colors
+    def angle_color(yaw_vals):
+        colors = np.full(yaw_vals.shape, 'gray', dtype=object)   # 先全部兜底
+        mask0 = (yaw_vals >= 0)   & (yaw_vals < 90)
+        mask1 = (yaw_vals >= 90)  & (yaw_vals < 180)
+        mask2 = (yaw_vals >= 180) & (yaw_vals < 270)
+        mask3 = (yaw_vals >= 270) & (yaw_vals < 360)
+        colors[mask0] = 'red'
+        colors[mask1] = 'green'
+        colors[mask2] = 'blue'
+        colors[mask3] = 'orange'
+        return colors
         colors_raw = angle_color(step0_yaw)
-        colors_cal = angle_color(step0_yaw)   # 同一套 yaw
+        colors_cal = angle_color(step0_yaw)
 
         # 绘制
         dlg_xy = QDialog(self.window)
@@ -524,11 +540,11 @@ class CalibrationApp(QObject):
 
         # 原始
         ax1.scatter(mx_raw, my_raw, s=20, c=colors_raw, alpha=0.7)
-        ax1.add_patch(plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1))
-        ax1.plot(0, 0, 'k+', markersize=12, markeredgewidth=2)  # ← 加这句
+        circle1 = plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1)
+        ax1.add_patch(circle1)
+        ax1.plot(0, 0, 'k+')
         ax1.axhline(0, color='black', linewidth=1.5)
         ax1.axvline(0, color='black', linewidth=1.5)
-
         ax1.set_aspect('equal')
         ax1.set_title("Step 0 Raw Data (90° Segments)")
         ax1.set_xlabel("Raw MX")
@@ -537,11 +553,11 @@ class CalibrationApp(QObject):
 
         # 校准后
         ax2.scatter(cal_mx, cal_my, s=20, c=colors_cal, alpha=0.7)
-        ax2.add_patch(plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1))
-        ax2.plot(0, 0, 'k+', markersize=12, markeredgewidth=2)  # ← 加这句
+        circle2 = plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1)
+        ax2.add_patch(circle2)
+        ax2.plot(0, 0, 'k+')
         ax2.axhline(0, color='black', linewidth=1.5)
         ax2.axvline(0, color='black', linewidth=1.5)
-
         ax2.set_aspect('equal')
         ax2.set_title("Step 0 Calibrated Data (90° Segments)")
         ax2.set_xlabel("Calibrated MX")
@@ -562,176 +578,104 @@ class CalibrationApp(QObject):
         layout.addWidget(canvas_xy)
         dlg_xy.setLayout(layout)
         dlg_xy.exec_()
-        
-        # 额外显示角度分布直方图
-        self.show_step0_angle_distribution_histogram(step0_data, step0_grids)
 
-    def show_step0_angle_distribution_histogram(self, step0_data, step0_grids):
-        """显示第一步数据的角度分布直方图"""
-        # 直方图直接用 step0_yaw
-        step0_yaw = np.array(self.freeze_data)[
-            self.step_start_idx[0]:self.step_start_idx[1], 5
-        ]
-        # 计算校准后角度
-        pts_centered = step0_data - self.freeze_b
-        pts_cal = (self.freeze_A @ pts_centered.T).T
-        norm = np.linalg.norm(pts_cal, axis=1, keepdims=True)
-        norm = np.where(norm < 1e-6, 1, norm)
-        pts_cal_unit = pts_cal / norm
-        cal_mx = pts_cal_unit[:, 0]
-        cal_my = pts_cal_unit[:, 1]
-        angles_cal = np.arctan2(cal_my, cal_mx)
-        angles_deg_cal = np.degrees(angles_cal)
-        angles_deg_cal = np.where(angles_deg_cal < 0, angles_deg_cal + 360, angles_deg_cal)
-        
-        dlg_hist = QDialog(self.window)
-        dlg_hist.setWindowTitle("Step 0 Angle Distribution Histogram - Before and After Calibration")
-        dlg_hist.resize(1000, 400)
-        layout = QVBoxLayout(dlg_hist)
-        
-        fig_hist, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # 校准前的角度分布直方图
-        ax1.hist(step0_yaw, bins=36, range=(0, 360), edgecolor='black')
-        ax1.set_title("Raw Data Angle Distribution")
-        ax1.set_xlabel("Angle (degrees)")
-        ax1.set_ylabel("Count")
-        ax1.grid(True, alpha=0.3)
-        
-        # 校准后的角度分布直方图
-        ax2.hist(angles_deg_cal, bins=36, range=(0, 360), edgecolor='black')
-        ax2.set_title("Calibrated Data Angle Distribution")
-        ax2.set_xlabel("Angle (degrees)")
-        ax2.set_ylabel("Count")
-        ax2.grid(True, alpha=0.3)
-        
-        # 按格子编号的分布
-        ax3.hist(step0_grids, bins=36, range=(0, 36), alpha=0.7, color='red', edgecolor='black')
-        ax3.set_title("Data Distribution by Grid Index")
-        ax3.set_xlabel("Grid Index (0-35)")
-        ax3.set_ylabel("Count")
-        ax3.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        canvas_hist = FigureCanvas2D(fig_hist)
-        layout.addWidget(canvas_hist)
-        dlg_hist.setLayout(layout)
-        dlg_hist.exec_()
 
     @pyqtSlot()
     def on_algo3d(self):
-        fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", "", "CSV (*.csv)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self.window,
+            "Select CSV (8-col, last = step_id)",
+            "", "CSV (*.csv)")
         if not fname:
             return
         try:
-            # 读取所有列
             raw_all = np.loadtxt(fname, delimiter=',', ndmin=2)
-            
-            # 检查列数是否为 3, 6, 或 7
-            if raw_all.shape[1] not in (3, 6, 7):
-                raise ValueError("CSV must be N×3, N×6, or N×7")
+            # 允许 7 或 8 列，兼容旧文件
+            if raw_all.shape[1] not in (7, 8):
+                raise ValueError("CSV must be N×7 or N×8 with step_id as last column")
 
-            # 如果是 7 列，提取前 6 列（mx, my, mz, pitch, roll, yaw）
-            if raw_all.shape[1] == 7:
-                raw = raw_all[:, :6]
-            else:
-                raw = raw_all  # 3列或6列的情况
-            
-            b, A = fit_ellipsoid_3d(raw)
+            xyz     = raw_all[:, :3]
+            step_id = raw_all[:, -1].astype(int)   # 最后一列总是 step_id
+
+            # 整体椭球拟合
+            b, A = fit_ellipsoid_3d(xyz)
             if b is None or A is None:
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return
 
-            pts_raw_unit = raw_to_unit(raw, b)
-            pts_cal_unit = ellipsoid_to_sphere(raw, b, A)
+            pts_raw_unit = raw_to_unit(xyz, b)
+            pts_cal_unit = ellipsoid_to_sphere(xyz, b, A)
 
-            # ... 后续代码保持不变 ...
-
-            n = len(pts_raw_unit)
-            k = n // 3
-            colors = ['#ff0080', '#00e5ff', '#8000FF']
-            sections = ['Level', 'Tilt', 'Stern']
-
+            # ---------- 3D 总览 ----------
             dlg = QDialog(self.window)
             dlg.setWindowTitle("Algorithm 3D View")
             dlg.resize(900, 600)
-
             fig = plt.figure(figsize=(9, 6))
             ax_raw = fig.add_subplot(121, projection='3d')
-            ax_raw.set_title("Raw Unit Sphere (Hard-Iron Only)")
-            ax_raw.set_box_aspect([1, 1, 1])
-            draw_unit_sphere(ax_raw, r=1.0)
-            for i, (c, lab) in enumerate(zip(colors, sections)):
-                seg = pts_raw_unit[i*k:(i+1)*k]
-                if len(seg):
-                    ax_raw.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
-            ax_raw.legend()
-
             ax_cal = fig.add_subplot(122, projection='3d')
-            ax_cal.set_title("Calibrated Unit Sphere")
-            ax_cal.set_box_aspect([1, 1, 1])
-            draw_unit_sphere(ax_cal, r=1.0)
-            for i, (c, lab) in enumerate(zip(colors, sections)):
-                seg = pts_cal_unit[i*k:(i+1)*k]
-                if len(seg):
-                    ax_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
-            ax_cal.legend()
+            for ax, title, pts in [(ax_raw, "Raw Unit Sphere", pts_raw_unit),
+                                   (ax_cal, "Calibrated Unit Sphere", pts_cal_unit)]:
+                draw_unit_sphere(ax, 1.0)
+                for s, c, lab in [(0, '#ff0080', 'Step0'),
+                                  (1, '#00e5ff', 'Step1'),
+                                  (2, '#8000FF', 'Step2')]:
+                    seg = pts[step_id == s]
+                    if len(seg):
+                        ax.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
+                ax.set_title(title)
+                ax.set_box_aspect([1, 1, 1])
+                ax.legend()
+            canvas = FigureCanvas(fig)
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(canvas)
+            dlg.setLayout(lay)
+            dlg.exec_()
+
+            # ---------- Step0 XY 图（使用下位机 yaw 角着色） ----------
+            mask0 = step_id == 0
+            xy0_raw = xyz[mask0, :2]
+            xy0_cal = pts_cal_unit[mask0, :2]
+
+            # 取出 Step0 的下位机 yaw 角（CSV 第6列）
+            yaw_step0 = raw_all[mask0, 5]          # 下位机原始 yaw
+            yaw_step0 = np.where(yaw_step0 < 0, yaw_step0 + 360, yaw_step0)
+
+            # 颜色映射：每90度一种颜色
+            def color_of_yaw(y):
+                if 0   <= y < 90:   return 'red'
+                if 90  <= y < 180:  return 'green'
+                if 180 <= y < 270:  return 'blue'
+                return 'orange'
+
+            colors = [color_of_yaw(y) for y in yaw_step0]
+
+            dlg = QDialog(self.window)
+            dlg.setWindowTitle("Step0 XY – Yaw Color")
+            dlg.resize(900, 450)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+            for ax, pts, title in [(ax1, xy0_raw, "Raw"), (ax2, xy0_cal, "Calibrated")]:
+                for c, label in [('red',   '0-90°'),
+                                 ('green', '90-180°'),
+                                 ('blue',  '180-270°'),
+                                 ('orange','270-360°')]:
+                    mask = [clr == c for clr in colors]
+                    ax.scatter(pts[mask, 0], pts[mask, 1], s=8, c=c, label=label)
+                ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
+                ax.plot(0, 0, 'k+')
+                ax.set_aspect('equal')
+                ax.set_title(title)
+                ax.legend()
+                ax.grid(alpha=0.3)
 
             canvas = FigureCanvas(fig)
             lay = QVBoxLayout(dlg)
             lay.addWidget(canvas)
-
-            # 3D 动画
-            from matplotlib.animation import FuncAnimation
-            FuncAnimation(fig, lambda i: ax_raw.view_init(20, i % 360), frames=360, interval=50)
-            FuncAnimation(fig, lambda i: ax_cal.view_init(20, i % 360), frames=360, interval=50)
-
-            # === 第一步完整数据 ===
-            step0_data = raw[:len(raw)//3, :3]          # 第一步全部磁数据
-            yaws_step0 = raw[:len(raw)//3, 5]          # 对应 yaw
-
-            # 校准后单位圆坐标
-            pts_step0_unit = ellipsoid_to_sphere(step0_data, b, A)
-
-            color_map = {(0, 90): 'r', (90, 180): 'g', (180, 270): 'b', (270, 360): 'y'}
-
-            dlg_compare = QDialog(self.window)
-            dlg_compare.setWindowTitle("Step0 XY: Raw vs Calibrated")
-            dlg_compare.resize(900, 450)
-            layout = QVBoxLayout(dlg_compare)
-            fig_compare, (ax_raw, ax_cal) = plt.subplots(1, 2, figsize=(12, 5))
-
-            # Raw XY（按角度着色）
-            for (s, e), c in color_map.items():
-                m = ((yaws_step0 >= s) & (yaws_step0 < e)) | ((yaws_step0 + 360 >= s) & (yaws_step0 + 360 < e))
-                ax_raw.scatter(step0_data[m, 0], step0_data[m, 1],
-                            s=4, c=c, label=f'{s}-{e} deg', alpha=0.7)
-
-            ax_raw.set_title("Raw XY (Step0 Full)")
-            ax_raw.set_aspect('equal'); ax_raw.grid(alpha=0.3); ax_raw.legend()
-
-            # Calibrated XY
-            for (s, e), c in color_map.items():
-                m = ((yaws_step0 >= s) & (yaws_step0 < e)) | ((yaws_step0 + 360 >= s) & (yaws_step0 + 360 < e))
-                ax_cal.scatter(pts_step0_unit[m, 0], pts_step0_unit[m, 1],
-                            s=4, c=c, label=f'{s}-{e} deg', alpha=0.7)
-            ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
-            ax_cal.set_title("Calibrated XY (Step0 Full)")
-            ax_cal.set_aspect('equal'); ax_cal.legend(); ax_cal.grid(alpha=0.3)
-
-            plt.tight_layout()
-            layout.addWidget(FigureCanvas2D(fig_compare))
-            dlg_compare.setLayout(layout)
-            dlg_compare.exec_()
-
+            dlg.setLayout(lay)
             dlg.exec_()
-            
-            # 显示第一步数据校准后的XY图
-            self.show_step0_calibrated_xy_from_algo(b, A, raw)
+
         except Exception as e:
             QMessageBox.critical(self.window, "Error", str(e))
-
 
     def show_step0_calibrated_xy_from_algo(self, b, A, raw_data):
         """显示算法处理后第一步数据的XY图"""
@@ -804,7 +748,30 @@ class CalibrationApp(QObject):
         layout.addWidget(canvas_xy)
         dlg_xy.setLayout(layout)
         dlg_xy.exec_()
+    def _show_step0_xy_offline(self, xy_raw, xy_cal):
+        """离线 Step0 XY 图并打印三指标"""
+        def metrics_str(xy):
+            d = np.linalg.norm(xy, axis=1)
+            mean, std = d.mean(), d.std()
+            return f"Mean={mean:.4f}\nStd={std:.4f}\nCircErr={std/mean:.4f}"
 
+        dlg = QDialog(self.window)
+        dlg.setWindowTitle("Step0 XY – Offline")
+        dlg.resize(900, 450)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        for ax, pts, title, txt in [(ax1, xy_raw, "Raw", metrics_str(xy_raw)),
+                                    (ax2, xy_cal, "Calibrated", metrics_str(xy_cal))]:
+            ax.scatter(pts[:, 0], pts[:, 1], s=8, c='b')
+            ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
+            ax.plot(0, 0, 'k+')
+            ax.set_aspect('equal')
+            ax.set_title(f"{title}\n{txt}")
+            ax.grid(alpha=0.3)
+        plt.tight_layout()
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(FigureCanvas(fig))
+        dlg.setLayout(lay)
+        dlg.exec_()    
     def run(self):
         self.window.show()
         sys.exit(self.app.exec_())

@@ -395,18 +395,23 @@ class CalibrationApp(QObject):
             self.window.set_status("3D Calibration failed")
             return
 
-        # ---------- 1) 保存带 step_id 的 CSV ----------
-       # 新：直接取采集时记录的 step_id（第8列）
+        # ---- 整体缩放修正（保证 mean distance = 1.0）----
+        xyz = np.array(self.freeze_data)[:, :3]
+        pts_centered = xyz - self.freeze_b
+        scale = 1.0 / np.mean(np.linalg.norm(pts_centered @ self.freeze_A.T, axis=1))
+        self.freeze_A *= scale
+        # -----------------------------------------------
+
+        # 保存文件
         step_ids = np.array([row[-1] for row in self.freeze_data])
         save_arr = np.hstack([np.array(self.freeze_data), step_ids.reshape(-1, 1)])
         np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
                    save_arr, delimiter=',', fmt='%.6f')
 
-        # ---------- 2) 其余不变 ----------
-        xyz = np.array(self.freeze_data)[:, :3]
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
         np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"),
                    pts_cal_unit, delimiter=',', fmt='%.8f')
+
         c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
         with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
             f.write(c_code)
@@ -415,12 +420,10 @@ class CalibrationApp(QObject):
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.window.set_status("3D Three-Step Done")
-
     def view_result_3d(self):
         if self.freeze_data is None:
             return
 
-        import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
 
         xyz = np.array(self.freeze_data)[:, :3]
@@ -428,6 +431,12 @@ class CalibrationApp(QObject):
         k = n // 3
         colors = ['#ff0080', '#00e5ff', '#8000FF']
         labels = ['Level', 'Tilt', 'Stern']
+
+        # 重新计算并打印
+        pts_cal_unit = (self.freeze_A @ (xyz - self.freeze_b).T).T
+        pts_cal_unit /= np.linalg.norm(pts_cal_unit, axis=1, keepdims=True)
+        mean_dist = np.mean(np.linalg.norm(pts_cal_unit, axis=1))
+        print("Calibrated unit sphere mean distance:", mean_dist)
 
         # Raw 3D
         self.ax3d.clear()
@@ -454,10 +463,6 @@ class CalibrationApp(QObject):
         self.canvas_raw_sphere.draw()
 
         # Calibrated Unit Sphere
-        pts_centered = xyz - self.freeze_b
-        pts_cal = (self.freeze_A @ pts_centered.T).T
-        pts_cal_unit = pts_cal / np.linalg.norm(pts_cal, axis=1, keepdims=True)
-
         self.ax3d_cal.clear()
         draw_unit_sphere(self.ax3d_cal, r=1.0)
         for i, (c, lab) in enumerate(zip(colors, labels)):
@@ -475,54 +480,36 @@ class CalibrationApp(QObject):
         self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
         self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
 
-        # XY 平面图（模态，不会闪退）
+        # XY 平面弹窗（保持不变）
         dlg2d = QDialog(self.window)
         dlg2d.setWindowTitle("Calibrated XY Projection")
         dlg2d.resize(450, 450)
         layout = QVBoxLayout(dlg2d)
         fig2d, ax2d = plt.subplots()
         ax2d.set_aspect('equal')
-
-        # 直接使用下位机 yaw
-        yaws = np.array(self.freeze_data)[:, 5]   # 第5列就是 yaw
-
-        # 根据 yaw 角划分颜色
-        color_map = {
-            (0, 90): 'r',   # 第一象限
-            (90, 180): 'g', # 第二象限
-            (180, 270): 'b',# 第三象限
-            (270, 360): 'm' # 第四象限
-        }
-
+        yaws = np.array(self.freeze_data)[:, 5]
+        color_map = {(0, 90): 'r', (90, 180): 'g', (180, 270): 'b', (270, 360): 'm'}
         for (start, end), color in color_map.items():
             mask = ((yaws >= start) & (yaws < end)) | ((yaws + 360 >= start) & (yaws + 360 < end))
             ax2d.scatter(pts_cal_unit[mask, 0], pts_cal_unit[mask, 1], s=4, c=color, label=f'{start}-{end} deg')
-
         circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
         ax2d.add_patch(circle)
         ax2d.set_title("Calibrated XY Plane Projection")
         ax2d.legend()
-        # 计算并显示三行指标
-        distances = np.sqrt(pts_cal_unit[:, 0]**2 + pts_cal_unit[:, 1]**2)
-        mean_dist = np.mean(distances)
-        std_dist  = np.std(distances)
-        circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
-
+        distances = np.linalg.norm(pts_cal_unit[:, :2], axis=1)
         ax2d.text(0.02, 0.98,
-                  f"Mean distance: {mean_dist:.4f}\n"
-                  f"Std deviation: {std_dist:.4f}\n"
-                  f"Circularity error: {circularity_error:.4f}",
+                  f"Mean distance: {np.mean(distances):.4f}\n"
+                  f"Std deviation: {np.std(distances):.4f}\n"
+                  f"Circularity error: {np.std(distances)/np.mean(distances):.4f}",
                   transform=ax2d.transAxes,
                   verticalalignment='top',
                   fontsize=10,
                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-
         canvas2d = FigureCanvas2D(fig2d)
         layout.addWidget(canvas2d)
         dlg2d.setLayout(layout)
         dlg2d.exec_()
-        
-       # 额外显示角度分布直方图
+
         self.show_step0_angle_distribution_histogram()
     @staticmethod
     def angle_color(yaw_vals):
@@ -617,28 +604,34 @@ class CalibrationApp(QObject):
     @pyqtSlot()
     def on_algo3d(self):
         fname, _ = QFileDialog.getOpenFileName(
-            self.window,
-            "Select CSV (8-col, last = step_id)",
-            "", "CSV (*.csv)")
+            self.window, "Select CSV (8-col, last = step_id)", "", "CSV (*.csv)")
         if not fname:
             return
         try:
             raw_all = np.loadtxt(fname, delimiter=',', ndmin=2)
-            # 允许 7 或 8 列，兼容旧文件
             if raw_all.shape[1] not in (7, 8, 9):
                 raise ValueError("CSV must be N×7 or N×8 with step_id as last column")
 
             xyz     = raw_all[:, :3]
-            step_id = raw_all[:, -1].astype(int)   # 最后一列总是 step_id
+            step_id = raw_all[:, -1].astype(int)
 
-            # 整体椭球拟合
+            # 椭球拟合
             b, A = fit_ellipsoid_3d(xyz)
             if b is None or A is None:
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return
 
+            # ---- 整体缩放修正（保证 mean distance = 1.0）----
+            scale = 1.0 / np.mean(np.linalg.norm((xyz - b) @ A.T, axis=1))
+            A *= scale
+            # -----------------------------------------------
+
             pts_raw_unit = raw_to_unit(xyz, b)
             pts_cal_unit = ellipsoid_to_sphere(xyz, b, A)
+
+            # ---- 打印指标 ----
+            mean_dist = np.mean(np.linalg.norm(pts_cal_unit, axis=1))
+            print("Algo3D 修正后 mean distance:", mean_dist)
 
             # ---------- 3D 总览 ----------
             dlg = QDialog(self.window)
@@ -665,16 +658,13 @@ class CalibrationApp(QObject):
             dlg.setLayout(lay)
             dlg.exec_()
 
-            # ---------- Step0 XY 图（使用下位机 yaw 角着色） ----------
+            # ---------- Step0 XY ----------
             mask0 = step_id == 0
             xy0_raw = xyz[mask0, :2]
             xy0_cal = pts_cal_unit[mask0, :2]
-
-            # 取出 Step0 的下位机 yaw 角（CSV 第6列）
-            yaw_step0 = raw_all[mask0, 5]          # 下位机原始 yaw
+            yaw_step0 = raw_all[mask0, 5]
             yaw_step0 = np.where(yaw_step0 < 0, yaw_step0 + 360, yaw_step0)
 
-            # 颜色映射：每90度一种颜色
             def color_of_yaw(y):
                 if 0   <= y < 90:   return 'red'
                 if 90  <= y < 180:  return 'green'
@@ -684,15 +674,12 @@ class CalibrationApp(QObject):
             colors = [color_of_yaw(y) for y in yaw_step0]
 
             dlg = QDialog(self.window)
-            dlg.setWindowTitle("Step0 XY – Yaw Color")
+            dlg.setWindowTitle("Step0 XY – Algo3D")
             dlg.resize(900, 450)
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
             for ax, pts, title in [(ax1, xy0_raw, "Raw"), (ax2, xy0_cal, "Calibrated")]:
-                for c, label in [('red',   '0-90°'),
-                                 ('green', '90-180°'),
-                                 ('blue',  '180-270°'),
-                                 ('orange','270-360°')]:
+                for c, label in [('red', '0-90°'), ('green', '90-180°'),
+                                 ('blue', '180-270°'), ('orange', '270-360°')]:
                     mask = [clr == c for clr in colors]
                     ax.scatter(pts[mask, 0], pts[mask, 1], s=8, c=c, label=label)
                 ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
@@ -701,22 +688,11 @@ class CalibrationApp(QObject):
                 ax.set_title(title)
                 ax.legend()
                 ax.grid(alpha=0.3)
-                # 计算并显示三行指标
-                distances = np.linalg.norm(xy0_cal, axis=1)
-                mean_dist = np.mean(distances)
-                std_dist = np.std(distances)
-                circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
-
+                d = np.linalg.norm(pts, axis=1)
                 ax.text(0.02, 0.98,
-                        f"Mean distance: {mean_dist:.4f}\n"
-                        f"Std deviation: {std_dist:.4f}\n"
-                        f"Circularity error: {circularity_error:.4f}",
-                        transform=ax.transAxes,
-                        verticalalignment='top',
-                        fontsize=10,
-                        family='monospace',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='none', alpha=0.9))
-
+                        f"Mean={np.mean(d):.4f}\nStd={np.std(d):.4f}\nCircErr={np.std(d)/np.mean(d):.4f}",
+                        transform=ax.transAxes, va='top',
+                        bbox=dict(boxstyle='round', fc='white', alpha=0.8))
             canvas = FigureCanvas(fig)
             lay = QVBoxLayout(dlg)
             lay.addWidget(canvas)

@@ -482,6 +482,20 @@ class CalibrationApp(QObject):
         ax2d.add_patch(circle)
         ax2d.set_title("Calibrated XY Plane Projection")
         ax2d.legend()
+        # 计算并显示三行指标
+        distances = np.sqrt(pts_cal_unit[:, 0]**2 + pts_cal_unit[:, 1]**2)
+        mean_dist = np.mean(distances)
+        std_dist  = np.std(distances)
+        circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
+
+        ax2d.text(0.02, 0.98,
+                  f"Mean distance: {mean_dist:.4f}\n"
+                  f"Std deviation: {std_dist:.4f}\n"
+                  f"Circularity error: {circularity_error:.4f}",
+                  transform=ax2d.transAxes,
+                  verticalalignment='top',
+                  fontsize=10,
+                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
         canvas2d = FigureCanvas2D(fig2d)
         layout.addWidget(canvas2d)
@@ -490,7 +504,18 @@ class CalibrationApp(QObject):
         
        # 额外显示角度分布直方图
         self.show_step0_angle_distribution_histogram()
-
+    @staticmethod
+    def angle_color(yaw_vals):
+        colors = np.full(yaw_vals.shape, 'gray', dtype=object)
+        mask0 = (yaw_vals >= 0)   & (yaw_vals < 90)
+        mask1 = (yaw_vals >= 90)  & (yaw_vals < 180)
+        mask2 = (yaw_vals >= 180) & (yaw_vals < 270)
+        mask3 = (yaw_vals >= 270) & (yaw_vals < 360)
+        colors[mask0] = 'red'
+        colors[mask1] = 'green'
+        colors[mask2] = 'blue'
+        colors[mask3] = 'orange'
+        return colors
     def show_step0_angle_distribution_histogram(self):
         """显示第一步数据校准前后的XY图，按90°分段着色"""
         if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
@@ -516,19 +541,8 @@ class CalibrationApp(QObject):
         step0_yaw = np.array(self.freeze_data)[
             self.step_start_idx[0]:self.step_start_idx[1], 5
         ]
-    def angle_color(yaw_vals):
-        colors = np.full(yaw_vals.shape, 'gray', dtype=object)   # 先全部兜底
-        mask0 = (yaw_vals >= 0)   & (yaw_vals < 90)
-        mask1 = (yaw_vals >= 90)  & (yaw_vals < 180)
-        mask2 = (yaw_vals >= 180) & (yaw_vals < 270)
-        mask3 = (yaw_vals >= 270) & (yaw_vals < 360)
-        colors[mask0] = 'red'
-        colors[mask1] = 'green'
-        colors[mask2] = 'blue'
-        colors[mask3] = 'orange'
-        return colors
-        colors_raw = angle_color(step0_yaw)
-        colors_cal = angle_color(step0_yaw)
+        colors_raw = self.angle_color(step0_yaw)
+        colors_cal = self.angle_color(step0_yaw)
 
         # 绘制
         dlg_xy = QDialog(self.window)
@@ -667,6 +681,21 @@ class CalibrationApp(QObject):
                 ax.set_title(title)
                 ax.legend()
                 ax.grid(alpha=0.3)
+                # 计算并显示三行指标
+                distances = np.linalg.norm(xy0_cal, axis=1)
+                mean_dist = np.mean(distances)
+                std_dist = np.std(distances)
+                circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
+
+                ax.text(0.02, 0.98,
+                        f"Mean distance: {mean_dist:.4f}\n"
+                        f"Std deviation: {std_dist:.4f}\n"
+                        f"Circularity error: {circularity_error:.4f}",
+                        transform=ax.transAxes,
+                        verticalalignment='top',
+                        fontsize=10,
+                        family='monospace',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='none', alpha=0.9))
 
             canvas = FigureCanvas(fig)
             lay = QVBoxLayout(dlg)
@@ -691,7 +720,7 @@ class CalibrationApp(QObject):
         
         # 计算角度用于着色
         yaws_step0 = raw_data[:k, 5]
-        angles_deg = np.where(angles_deg < 0, angles_deg + 360, angles_deg)
+        angles_deg = np.where(angles_deg < 0, angles_deg + 360, yaws_step0)
         
         # 创建新的对话框显示第一步校准后的XY图
         dlg_xy = QDialog(self.window)
@@ -728,7 +757,19 @@ class CalibrationApp(QObject):
         ax_xy.set_ylabel("Calibrated MY")
         ax_xy.grid(True, alpha=0.3)
         ax_xy.legend()
-        
+        # 计算并显示指标
+        distances = np.sqrt(cal_mx**2 + cal_my**2)
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        circularity_error = std_dist / mean_dist if mean_dist != 0 else 0
+
+        ax_xy.text(0.02, 0.98,
+                   f"Mean distance: {mean_dist:.4f}\n"
+                   f"Std deviation: {std_dist:.4f}\n"
+                   f"Circularity error: {circularity_error:.4f}",
+                   transform=ax_xy.transAxes,
+                   verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         # 计算并显示统计数据
         distances = np.sqrt(cal_mx**2 + cal_my**2)
         mean_dist = np.mean(distances)

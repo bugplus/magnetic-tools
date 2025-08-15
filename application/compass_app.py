@@ -86,37 +86,57 @@ class SerialThread(QThread):
 # 2. 核心函数
 # -----------------------------
 def fit_ellipsoid_3d(points):
+    """
+    3D 椭球 + 2D 圆度约束
+    一次优化，让 3D 球 + XY 投影圆同时成立
+    """
     pts = np.asarray(points, dtype=float)[:, :3]
-    if pts.shape[0] < 10:
+    N = pts.shape[0]
+    if N < 10:
         return None, None
 
-    # 1. 中心化
+    # 1. 中心化 & 归一化（防除零）
     mean = np.mean(pts, axis=0)
     pts_centered = pts - mean
-
-    # 2. 归一化尺度：防止病态
     scale = np.std(pts_centered, axis=0)
+    scale = np.where(scale == 0, 1.0, scale)
     pts_norm = pts_centered / scale
-
-    # 3. 椭球拟合（10 参数）
     x, y, z = pts_norm.T
-    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
-    reg = 1e-3 * np.trace(D.T @ D) / D.shape[0]
-    coeffs = np.linalg.solve(D.T @ D + reg * np.eye(10), D.T @ np.ones_like(x))
 
+    # 2. 3D 椭球设计矩阵 (N × 10)
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones(N)])
+
+    # 3. 2D 圆度约束：x² - y² ≈ 0，对应 1×10 行向量
+    C_row = np.array([[1e-2, -1e-2, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+    # 4. 增广矩阵 / 向量
+    A_aug = np.vstack([D, C_row])               # (N+1, 10)
+    b_aug = np.hstack([np.ones(N), 0.0])        # (N+1,)
+
+    # 5. 正则 & 求解
+    reg = 1e-3 * np.trace(D.T @ D) / N
+    coeffs, *_ = np.linalg.lstsq(A_aug.T @ A_aug + reg * np.eye(10),
+                                 A_aug.T @ b_aug, rcond=None)
+
+    # 6. 提取参数
     Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
-    Q = np.array([[Aq, Dq/2, Eq/2], [Dq/2, Bq, Fq/2], [Eq/2, Fq/2, Cq]])
-    b_norm = -np.linalg.solve(Q, [G, H, I]) / 2
+    Q = np.array([[Aq, Dq/2, Eq/2],
+                  [Dq/2, Bq, Fq/2],
+                  [Eq/2, Fq/2, Cq]])
+    try:
+        b_norm = -np.linalg.solve(Q, [G, H, I]) / 2
+    except np.linalg.LinAlgError:
+        return None, None
 
-    # 4. 反归一化
+    # 7. 反归一化
     b = b_norm * scale + mean
-
     U, S, Vt = np.linalg.svd(Q)
-    scale = 1.0 / np.sqrt(np.maximum(S, 1e-12))
-    A_raw = Vt.T @ np.diag(scale) @ Vt
-    det = np.linalg.det(A_raw)
-    A_raw = A_raw * np.sign(det)
-    A = A_raw / np.linalg.norm(A_raw, ord='fro')   # ← 关键：用 Frobenius 范数归一
+    S_safe = np.maximum(S, 1e-12)
+    scale_vec = 1.0 / np.sqrt(S_safe)
+    A_raw = Vt.T @ np.diag(scale_vec) @ Vt
+    A_raw *= np.sign(np.linalg.det(A_raw))
+    A = A_raw / np.linalg.norm(A_raw, ord='fro')
+
     return b, A
 
 def generate_c_code_3d(b, A):
@@ -605,7 +625,7 @@ class CalibrationApp(QObject):
         try:
             raw_all = np.loadtxt(fname, delimiter=',', ndmin=2)
             # 允许 7 或 8 列，兼容旧文件
-            if raw_all.shape[1] not in (7, 8):
+            if raw_all.shape[1] not in (7, 8, 9):
                 raise ValueError("CSV must be N×7 or N×8 with step_id as last column")
 
             xyz     = raw_all[:, :3]

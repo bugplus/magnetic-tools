@@ -57,7 +57,9 @@ class SerialThread(QThread):
                     
                     m = re.search(r'mag_x=\s*([-\d\.eE+-]+),\s*mag_y=\s*([-\d\.eE+-]+),\s*mag_z=\s*([-\d\.eE+-]+)', line)
                     if m:
-                        mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
+                        # todo test
+                        # mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
+                        mx, my, mz = float(m.group(1)), float(m.group(2)), float(m.group(3))
                         # print(f"Magnetometer - X: {mx}, Y: {my}, Z: {mz}")
                         
                     a = re.search(r'\s*pitch=\s*([-\d\.eE+-]+)\s*,\s*roll=\s*([-\d\.eE+-]+)\s*,\s*yaw=\s*([-\d\.eE+-]+)', line)

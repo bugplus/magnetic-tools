@@ -19,6 +19,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.colors import LightSource
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas2D
 from PyQt5.QtWidgets import QDialog, QVBoxLayout
+from scipy.linalg import sqrtm   # 需要 SciPy
 from config import (
     CALIBRATION_DURATION, MIN_3D_POINTS,
     ANGLE_GATE_DEG, DIST_GATE_CM,
@@ -58,8 +59,8 @@ class SerialThread(QThread):
                     m = re.search(r'mag_x=\s*([-\d\.eE+-]+),\s*mag_y=\s*([-\d\.eE+-]+),\s*mag_z=\s*([-\d\.eE+-]+)', line)
                     if m:
                         # todo test
-                        # mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
-                        mx, my, mz = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                        mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
+                        # mx, my, mz = float(m.group(1)), float(m.group(2)), float(m.group(3))
                         # print(f"Magnetometer - X: {mx}, Y: {my}, Z: {mz}")
                         
                     a = re.search(r'\s*pitch=\s*([-\d\.eE+-]+)\s*,\s*roll=\s*([-\d\.eE+-]+)\s*,\s*yaw=\s*([-\d\.eE+-]+)', line)
@@ -87,58 +88,60 @@ class SerialThread(QThread):
 # -----------------------------
 # 2. 核心函数
 # -----------------------------
+from scipy.linalg import sqrtm   # 放在文件顶部 import 区即可
+
 def fit_ellipsoid_3d(points):
     """
-    3D 椭球 + 2D 圆度约束
-    一次优化，让 3D 球 + XY 投影圆同时成立
+    修正版 3D 椭球拟合
+    返回 (b, A)：
+        b : 硬铁偏移 (3,)
+        A : 椭球->单位球的线性变换 (3,3)，已保证平均半径=1
     """
     pts = np.asarray(points, dtype=float)[:, :3]
-    N = pts.shape[0]
-    if N < 10:
+    if pts.shape[0] < 10:
         return None, None
 
-    # 1. 中心化 & 归一化（防除零）
+    # 1. 归一化防止病态
     mean = np.mean(pts, axis=0)
-    pts_centered = pts - mean
-    scale = np.std(pts_centered, axis=0)
+    centered = pts - mean
+    scale = np.std(centered, axis=0)
     scale = np.where(scale == 0, 1.0, scale)
-    pts_norm = pts_centered / scale
+    pts_norm = centered / scale
     x, y, z = pts_norm.T
 
-    # 2. 3D 椭球设计矩阵 (N × 10)
-    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones(N)])
-
-    # 3. 2D 圆度约束：x² - y² ≈ 0，对应 1×10 行向量
-    C_row = np.array([[1e-2, -1e-2, 0, 0, 0, 0, 0, 0, 0, 0]])
-
-    # 4. 增广矩阵 / 向量
-    A_aug = np.vstack([D, C_row])               # (N+1, 10)
-    b_aug = np.hstack([np.ones(N), 0.0])        # (N+1,)
-
-    # 5. 正则 & 求解
-    reg = 1e-3 * np.trace(D.T @ D) / N
+    # 2. 设计矩阵 & 圆度约束
+    D = np.column_stack([x*x, y*y, z*z, x*y, x*z, y*z, x, y, z, np.ones_like(x)])
+    C = np.array([[1.0, -1.0, 0, 0, 0, 0, 0, 0, 0, 0]])
+    A_aug = np.vstack([D, C])
+    b_aug = np.hstack([np.ones(pts.shape[0]), 0.0])
+    reg = 1e-3 * np.trace(D.T @ D) / pts.shape[0]
     coeffs, *_ = np.linalg.lstsq(A_aug.T @ A_aug + reg * np.eye(10),
                                  A_aug.T @ b_aug, rcond=None)
 
-    # 6. 提取参数
-    Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, J = coeffs
+    # 3. 提取 Q
+    Aq, Bq, Cq, Dq, Eq, Fq, G, H, I, _ = coeffs
     Q = np.array([[Aq, Dq/2, Eq/2],
                   [Dq/2, Bq, Fq/2],
                   [Eq/2, Fq/2, Cq]])
+
     try:
         b_norm = -np.linalg.solve(Q, [G, H, I]) / 2
     except np.linalg.LinAlgError:
         return None, None
 
-    # 7. 反归一化
-    b = b_norm * scale + mean
-    U, S, Vt = np.linalg.svd(Q)
-    S_safe = np.maximum(S, 1e-12)
-    scale_vec = 1.0 / np.sqrt(S_safe)
-    A_raw = Vt.T @ np.diag(scale_vec) @ Vt
-    A_raw *= np.sign(np.linalg.det(A_raw))
-    A = A_raw / np.linalg.norm(A_raw, ord='fro')
+    # 4. 椭球->单位球矩阵 A = Q^{1/2}
+    A_q = sqrtm(Q)
+    if np.iscomplexobj(A_q):
+        return None, None
+    A_q *= np.sign(np.linalg.det(A_q))
 
+    # 5. 强制平均半径=1（归一化坐标系）
+    radii = np.linalg.norm(pts_norm @ A_q, axis=1)
+    A_q /= np.mean(radii)
+
+    # 6. 还原到原始尺度
+    A = A_q / scale[None, :]
+    b = b_norm * scale + mean
     return b, A
 
 def generate_c_code_3d(b, A):
@@ -165,14 +168,8 @@ def raw_to_unit(raw_xyz, b):
     return centered / length
 
 def ellipsoid_to_sphere(raw_xyz, b, A):
-    centered = raw_xyz[:, :3] - b
-    # ↓ 只加这一行，防病态，不影响外部
-    safe_scale = max(np.abs(centered).max(), 1e-6)
-    sphere = (centered / safe_scale) @ np.linalg.inv(A * safe_scale)
-    norm = np.linalg.norm(sphere, axis=1, keepdims=True)
-    norm = np.where(norm < 1e-6, 1, norm)
-    sphere = sphere / norm
-    return sphere
+    """直接用新的 A，无需再处理病态 scale"""
+    return (raw_xyz[:, :3] - b) @ A.T
 def draw_unit_sphere(ax, r=1.0):
     u = np.linspace(0, 2 * np.pi, 60)
     v = np.linspace(0, np.pi, 30)
@@ -398,10 +395,10 @@ class CalibrationApp(QObject):
             return
 
         # ---- 整体缩放修正（保证 mean distance = 1.0）----
-        xyz = np.array(self.freeze_data)[:, :3]
-        pts_centered = xyz - self.freeze_b
-        scale = 1.0 / np.mean(np.linalg.norm(pts_centered @ self.freeze_A.T, axis=1))
-        self.freeze_A *= scale
+        # xyz = np.array(self.freeze_data)[:, :3]
+        # pts_centered = xyz - self.freeze_b
+        # scale = 1.0 / np.mean(np.linalg.norm(pts_centered @ self.freeze_A.T, axis=1))
+        # self.freeze_A *= scale
         # -----------------------------------------------
 
         # 保存文件
@@ -410,7 +407,9 @@ class CalibrationApp(QObject):
         np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
                    save_arr, delimiter=',', fmt='%.6f')
 
+        xyz = np.array(self.freeze_data)[:, :3]
         pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
+        # ---- 打印指标 ----
         np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"),
                    pts_cal_unit, delimiter=',', fmt='%.8f')
 
@@ -624,8 +623,8 @@ class CalibrationApp(QObject):
                 return
 
             # ---- 整体缩放修正（保证 mean distance = 1.0）----
-            scale = 1.0 / np.mean(np.linalg.norm((xyz - b) @ A.T, axis=1))
-            A *= scale
+            # scale = 1.0 / np.mean(np.linalg.norm((xyz - b) @ A.T, axis=1))
+            # A *= scale
             # -----------------------------------------------
 
             pts_raw_unit = raw_to_unit(xyz, b)

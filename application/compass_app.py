@@ -26,7 +26,7 @@ from config import (
     UNIT_SPHERE_SCALE, DECIMAL_PRECISION,
     AUTO_YAW_RANGE_MIN, AUTO_PITCH_RANGE_MIN, AUTO_ROLL_RANGE_MIN,
     AUTO_STEP0_MIN_PTS, AUTO_STEP1_MIN_PTS, AUTO_STEP2_MIN_PTS,
-    GRID_STEP_DEG, POINTS_PER_GRID
+    GRID_STEP_DEG, POINTS_PER_GRID,STEP0_YAW_STEP_DEG ,STEP0_PPG          
 
 )
 import os
@@ -59,8 +59,8 @@ class SerialThread(QThread):
                     m = re.search(r'mag_x=\s*([-\d\.eE+-]+),\s*mag_y=\s*([-\d\.eE+-]+),\s*mag_z=\s*([-\d\.eE+-]+)', line)
                     if m:
                         # todo test
-                        mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
-                        # mx, my, mz = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                        # mx, my, mz = -float(m.group(2)), -float(m.group(1)), float(m.group(3))
+                        mx, my, mz = float(m.group(1)), float(m.group(2)), float(m.group(3))
                         # print(f"Magnetometer - X: {mx}, Y: {my}, Z: {mz}")
                         
                     a = re.search(r'\s*pitch=\s*([-\d\.eE+-]+)\s*,\s*roll=\s*([-\d\.eE+-]+)\s*,\s*yaw=\s*([-\d\.eE+-]+)', line)
@@ -325,8 +325,13 @@ class CalibrationApp(QObject):
 
         # 复用 config 变量
         need_per  = self.NEED_PER_GRID[step]
-        need_span = self.NEED_ANGLE_SPAN[step]
-        bins_yaw  = np.arange(0, AUTO_YAW_RANGE_MIN   + 1, GRID_STEP_DEG)
+        # 只对 Step0 用 2° 步长，其余保持 10°
+        if step == 0:
+            bins_yaw = np.arange(0, 361, 2)   # 2° 一格，共 180 格
+            need_per = 3                      # 每格至少 3 点
+        else:
+            bins_yaw = np.arange(0, AUTO_YAW_RANGE_MIN + 1, GRID_STEP_DEG)
+            need_per = POINTS_PER_GRID
         bins_pr   = np.arange(-90, 91, GRID_STEP_DEG)
 
         cnt_yaw,   _ = np.histogram(yaw,   bins=bins_yaw)
@@ -390,6 +395,9 @@ class CalibrationApp(QObject):
 
         self.freeze_data = list(self.mag3d_data)
         self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
+        xyz = np.array(self.freeze_data)[:, :3]
+        scale = 1.0 / np.mean(np.linalg.norm((xyz - self.freeze_b) @ self.freeze_A.T, axis=1))
+        self.freeze_A *= scale          # 关键修正
         if self.freeze_b is None or self.freeze_A is None:
             self.window.set_status("3D Calibration failed")
             return
@@ -623,8 +631,8 @@ class CalibrationApp(QObject):
                 return
 
             # ---- 整体缩放修正（保证 mean distance = 1.0）----
-            # scale = 1.0 / np.mean(np.linalg.norm((xyz - b) @ A.T, axis=1))
-            # A *= scale
+            scale = 1.0 / np.mean(np.linalg.norm((xyz - b) @ A.T, axis=1))
+            A *= scale
             # -----------------------------------------------
 
             pts_raw_unit = raw_to_unit(xyz, b)

@@ -20,6 +20,9 @@ AUTO_STEP2_MIN_PTS = 100
 # ---------------- 新自动下一步规则 ----------------
 GRID_STEP_DEG   = 10   # 每 10° 一格
 POINTS_PER_GRID = 10   # 每格至少 10 点
+# config.py 追加
+STEP0_YAW_STEP_DEG = 5          # Step0 水平每 2° 一格
+STEP0_PPG          = 3          # Step0 每格 3 点
 # ---------------- 坐标系 ----------------
 MAG_AXIS_MAP_A = [
     [0, 1, 0],

@@ -1,7 +1,7 @@
-/* 3D mag calibration (auto) */
-const float HARD_IRON[3] = {-353.67297005f, 210.58199923f, -129.66645457f};
+/* 3D mag calibration (forced concentric circle) */
+const float HARD_IRON[3] = {-333.85866968f, 200.51857584f, -296.02064918f};
 const float SOFT_IRON[3][3] = {
-  {0.00400933f, 0.00007343f, -0.00000289f},
-  {0.00006890f, 0.00422607f, 0.00000484f},
-  {-0.00000277f, 0.00000493f, 0.00405393f}
+  {1.0f, 0.0f, 0.0f},
+  {0.0f, 1.0f, 0.0f},
+  {0.0f, 0.0f, 1.0f}
 };

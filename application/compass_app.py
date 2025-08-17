@@ -1,5 +1,23 @@
 
 # 磁力计三步校准上位机
+# 作者：<bugplus>
+# 版本：1.0
+# 日期：2025-08-17
+# 描述：磁力计三步校准上位机，用于校准磁力计，校准结果保存到文件中。
+# 
+#  水平数据校准：
+#   1. 获取3D点云数据
+#   2. 拟合3D椭球
+#   3. 生成C代码
+#   4. 保存C代码到文件
+#   5. 运行C代码
+#   6. 获取结果
+#   7. 保存结果到文件
+#   8. 显示结果
+#   9. 循环以上步骤
+
+
+
 import sys
 import serial
 import threading
@@ -145,18 +163,20 @@ def fit_ellipsoid_3d(points):
     return b, A
 
 def generate_c_code_3d(b, A):
-    if b is None or A is None:
+    if b is None:
         return "/* Error: Calibration failed */"
-    
+
     bx, by, bz = b
-    A = np.linalg.inv(A)
+    # 强制软铁为单位阵 → 同心圆
+    A = np.eye(3)
+
     lines = [
-        "/* 3D mag calibration (auto) */",
+        "/* 3D mag calibration (forced concentric circle) */",
         f"const float HARD_IRON[3] = {{{bx:.8f}f, {by:.8f}f, {bz:.8f}f}};",
         "const float SOFT_IRON[3][3] = {",
-        f"  {{{A[0,0]:.8f}f, {A[0,1]:.8f}f, {A[0,2]:.8f}f}},",
-        f"  {{{A[1,0]:.8f}f, {A[1,1]:.8f}f, {A[1,2]:.8f}f}},",
-        f"  {{{A[2,0]:.8f}f, {A[2,1]:.8f}f, {A[2,2]:.8f}f}}",
+        "  {1.0f, 0.0f, 0.0f},",
+        "  {0.0f, 1.0f, 0.0f},",
+        "  {0.0f, 0.0f, 1.0f}",
         "};"
     ]
     return "\n".join(lines)
@@ -394,8 +414,19 @@ class CalibrationApp(QObject):
             return
 
         self.freeze_data = list(self.mag3d_data)
-        self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
-        xyz = np.array(self.freeze_data)[:, :3]
+
+        # self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
+        # xyz = np.array(self.freeze_data)[:, :3]
+        # 只用 Step 0（水平旋转）数据拟合
+        step0_xyz = np.array(self.freeze_data)[
+            self.step_start_idx[0]:self.step_start_idx[1], :3
+        ]
+        self.freeze_b, self.freeze_A = fit_ellipsoid_3d(step0_xyz)
+
+        # 强制修正为单位圆（可选：去掉软铁误差）
+        self.freeze_A = np.eye(3)
+
+        xyz = np.array(self.freeze_data)[:, :3]      # 保留这行后面还要用
         scale = 1.0 / np.mean(np.linalg.norm((xyz - self.freeze_b) @ self.freeze_A.T, axis=1))
         self.freeze_A *= scale          # 关键修正
         if self.freeze_b is None or self.freeze_A is None:
@@ -621,11 +652,20 @@ class CalibrationApp(QObject):
             if raw_all.shape[1] not in (7, 8, 9):
                 raise ValueError("CSV must be N×7 or N×8 with step_id as last column")
 
-            xyz     = raw_all[:, :3]
-            step_id = raw_all[:, -1].astype(int)
+            # xyz     = raw_all[:, :3]
+            # step_id = raw_all[:, -1].astype(int)
 
-            # 椭球拟合
-            b, A = fit_ellipsoid_3d(xyz)
+            # # 椭球拟合
+            # b, A = fit_ellipsoid_3d(xyz)
+            step_id = raw_all[:, -1].astype(int)
+            mask0   = step_id == 0
+            xyz0    = raw_all[mask0, :3]          # 只用 Step0 水平数据
+            b, A    = fit_ellipsoid_3d(xyz0)      # 重新拟合
+            # --- 强制同心（可选） ---
+            A = np.eye(3)
+
+            xyz = raw_all[:, :3]      # 补上这行，解决 NameError
+
             if b is None or A is None:
                 QMessageBox.warning(self.window, "Error", "Algorithm failed")
                 return

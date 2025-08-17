@@ -162,6 +162,43 @@ def fit_ellipsoid_3d(points):
     b = b_norm * scale + mean
     return b, A
 
+# ----------------- 新增 -----------------
+@staticmethod
+def rotate_to_level(mx, my, mz, pitch, roll):
+    """把磁矢量旋转回水平面，返回 (mx_level, my_level)"""
+    # 角度 → 弧度
+    pitch = np.radians(pitch)
+    roll  = np.radians(roll)
+
+    # 构造旋转矩阵：先绕 X 轴转 -pitch，再绕 Y 轴转 -roll
+    cx, sx = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(roll),  np.sin(roll)
+
+    # 注意符号：我们要把机体坐标系旋转回水平，所以用负角
+    R_x = np.array([[1, 0, 0],
+                    [0,  cx, sx],
+                    [0, -sx, cx]])
+
+    R_y = np.array([[ cy, 0, -sy],
+                    [  0, 1,  0],
+                    [ sy, 0,  cy]])
+
+    R = R_y @ R_x            # 先 X 后 Y
+    m_body = np.array([mx, my, mz])
+    m_level = R @ m_body     # 3×3 @ (3,) → (3,)
+
+    return m_level[0], m_level[1]   # 只取 XY 平面分量
+
+@staticmethod
+def fit_circle_2d(points_xy):
+    """最小二乘拟合二维圆，返回 (cx, cy, r)"""
+    x, y = points_xy[:, 0], points_xy[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
+    b = x**2 + y**2
+    (cx, cy, c), *_ = np.linalg.lstsq(A, b, rcond=None)
+    r = np.sqrt(cx**2 + cy**2 + c)
+    return np.array([cx, cy]), r
+# ---------------------------------------
 def generate_c_code_3d(b, A):
     if b is None:
         return "/* Error: Calibration failed */"
@@ -417,14 +454,31 @@ class CalibrationApp(QObject):
 
         # self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
         # xyz = np.array(self.freeze_data)[:, :3]
-        # 只用 Step 0（水平旋转）数据拟合
-        step0_xyz = np.array(self.freeze_data)[
-            self.step_start_idx[0]:self.step_start_idx[1], :3
-        ]
-        self.freeze_b, self.freeze_A = fit_ellipsoid_3d(step0_xyz)
+        # # 只用 Step 0（水平旋转）数据拟合
+        # step0_xyz = np.array(self.freeze_data)[
+        #     self.step_start_idx[0]:self.step_start_idx[1], :3
+        # ]
+        # self.freeze_b, self.freeze_A = fit_ellipsoid_3d(step0_xyz)
 
-        # 强制修正为单位圆（可选：去掉软铁误差）
+        # # 强制修正为单位圆（可选：去掉软铁误差）
+        # self.freeze_A = np.eye(3)
+        # ---------- 新 Step 0 逻辑 ----------
+        step0_slice = slice(self.step_start_idx[0], self.step_start_idx[1])
+        step0_chunk = np.array(self.freeze_data)[step0_slice]
+
+        # 1. 用六轴角度把磁矢量旋到水平面
+        level_xy = np.array([
+            self.rotate_to_level(mx, my, mz, p, r)
+            for mx, my, mz, p, r, *_ in step0_chunk
+        ])
+
+        # 2. 仅对水平 XY 点拟合正圆
+        (bx_by, _), _ = self.fit_circle_2d(level_xy)
+        # 把二维圆心扩展到三维：Z 方向偏移保持 0
+        self.freeze_b = np.array([*bx_by, 0.0])
+        # 强制软铁为单位阵
         self.freeze_A = np.eye(3)
+        # ----------------------------------------
 
         xyz = np.array(self.freeze_data)[:, :3]      # 保留这行后面还要用
         scale = 1.0 / np.mean(np.linalg.norm((xyz - self.freeze_b) @ self.freeze_A.T, axis=1))

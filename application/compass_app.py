@@ -162,42 +162,7 @@ def fit_ellipsoid_3d(points):
     b = b_norm * scale + mean
     return b, A
 
-# ----------------- 新增 -----------------
-@staticmethod
-def rotate_to_level(mx, my, mz, pitch, roll):
-    """把磁矢量旋转回水平面，返回 (mx_level, my_level)"""
-    # 角度 → 弧度
-    pitch = np.radians(pitch)
-    roll  = np.radians(roll)
 
-    # 构造旋转矩阵：先绕 X 轴转 -pitch，再绕 Y 轴转 -roll
-    cx, sx = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(roll),  np.sin(roll)
-
-    # 注意符号：我们要把机体坐标系旋转回水平，所以用负角
-    R_x = np.array([[1, 0, 0],
-                    [0,  cx, sx],
-                    [0, -sx, cx]])
-
-    R_y = np.array([[ cy, 0, -sy],
-                    [  0, 1,  0],
-                    [ sy, 0,  cy]])
-
-    R = R_y @ R_x            # 先 X 后 Y
-    m_body = np.array([mx, my, mz])
-    m_level = R @ m_body     # 3×3 @ (3,) → (3,)
-
-    return m_level[0], m_level[1]   # 只取 XY 平面分量
-
-@staticmethod
-def fit_circle_2d(points_xy):
-    """最小二乘拟合二维圆，返回 (cx, cy, r)"""
-    x, y = points_xy[:, 0], points_xy[:, 1]
-    A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
-    b = x**2 + y**2
-    (cx, cy, c), *_ = np.linalg.lstsq(A, b, rcond=None)
-    r = np.sqrt(cx**2 + cy**2 + c)
-    return np.array([cx, cy]), r
 # ---------------------------------------
 def generate_c_code_3d(b, A):
     if b is None:
@@ -243,6 +208,53 @@ def draw_unit_sphere(ax, r=1.0):
 # ... existing code until class CalibrationApp starts ...
 
 class CalibrationApp(QObject):
+    """磁力计三步校准主应用"""
+
+    # ================= 静态工具函数 =================
+    @staticmethod
+    def rotate_to_level(mx, my, mz, pitch, roll):
+        """把磁矢量旋转回水平面，返回 (mx_level, my_level)"""
+        pitch = np.radians(pitch)
+        roll  = np.radians(roll)
+
+        cx, sx = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(roll),  np.sin(roll)
+
+        R_x = np.array([[1,  0,   0],
+                        [0, cx,  sx],
+                        [0,-sx,  cx]])
+
+        R_y = np.array([[ cy, 0, -sy],
+                        [  0, 1,   0],
+                        [ sy, 0,  cy]])
+
+        R = R_y @ R_x
+        m_body = np.array([mx, my, mz])
+        m_level = R @ m_body
+        return float(m_level[0]), float(m_level[1])
+
+    @staticmethod
+    def fit_circle_2d(points_xy):
+        """最小二乘拟合二维圆，返回 (cx, cy) 和 radius"""
+        x, y = points_xy[:, 0], points_xy[:, 1]
+        A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
+        b = x**2 + y**2
+        (cx, cy, c), *_ = np.linalg.lstsq(A, b, rcond=None)
+        radius = np.sqrt(cx**2 + cy**2 + c)
+        return np.array([cx, cy], dtype=float), radius
+
+    @staticmethod
+    def fit_sphere_fixed_xy(points_3d, fixed_xy):
+        """固定 xy 球心，仅优化 bz 与半径"""
+        bx, by = fixed_xy
+        x, y, z = points_3d[:, 0], points_3d[:, 1], points_3d[:, 2]
+        A = np.column_stack([-2 * z, np.ones_like(z)])
+        rhs = (x - bx)**2 + (y - by)**2 + z**2
+        (bz, r_sq), *_ = np.linalg.lstsq(A, rhs, rcond=None)
+        radius = np.sqrt(r_sq + bz**2)
+        return np.array([bx, by, bz], dtype=float), radius
+
+    # ================ 构造/析构 ================
     def __init__(self):
         super().__init__()
         self.app = QApplication(sys.argv)
@@ -468,43 +480,32 @@ class CalibrationApp(QObject):
 
         # 1. 用六轴角度把磁矢量旋到水平面
         level_xy = np.array([
-            self.rotate_to_level(mx, my, mz, p, r)
-            for mx, my, mz, p, r, *_ in step0_chunk
+            CalibrationApp.rotate_to_level(mx, my, mz, pitch, roll)
+            for mx, my, mz, pitch, roll, *_ in step0_chunk
         ])
 
-        # 2. 仅对水平 XY 点拟合正圆
-        (bx_by, _), _ = self.fit_circle_2d(level_xy)
-        # 把二维圆心扩展到三维：Z 方向偏移保持 0
-        self.freeze_b = np.array([*bx_by, 0.0])
+        # 2. 仅对水平 XY 点拟合正圆 → 返回 (cx, cy)
+        (cx, cy), _ = CalibrationApp.fit_circle_2d(level_xy)
+        self.freeze_b = np.array([cx, cy, 0.0])
         # 强制软铁为单位阵
         self.freeze_A = np.eye(3)
         # ----------------------------------------
+        # ---------- 利用固定圆心 + 全数据拟合球 ----------
+        xyz_all = np.array(self.freeze_data)[:, :3]
+        bx_by = self.freeze_b[:2]              # 固定 Step 0 的 xy
+        self.freeze_b, radius = CalibrationApp.fit_sphere_fixed_xy(xyz_all, bx_by)
 
-        xyz = np.array(self.freeze_data)[:, :3]      # 保留这行后面还要用
-        scale = 1.0 / np.mean(np.linalg.norm((xyz - self.freeze_b) @ self.freeze_A.T, axis=1))
-        self.freeze_A *= scale          # 关键修正
-        if self.freeze_b is None or self.freeze_A is None:
-            self.window.set_status("3D Calibration failed")
-            return
+        # 统一比例因子：把半径拉到 1
+        scale = 1.0 / radius
+        self.freeze_A = np.eye(3) * scale      # 软铁仍为单位阵，仅整体缩放
 
-        # ---- 整体缩放修正（保证 mean distance = 1.0）----
-        # xyz = np.array(self.freeze_data)[:, :3]
-        # pts_centered = xyz - self.freeze_b
-        # scale = 1.0 / np.mean(np.linalg.norm(pts_centered @ self.freeze_A.T, axis=1))
-        # self.freeze_A *= scale
-        # -----------------------------------------------
-
-        # 保存文件
-        step_ids = np.array([row[-1] for row in self.freeze_data])
-        save_arr = np.hstack([np.array(self.freeze_data), step_ids.reshape(-1, 1)])
+        # 保存 / 打印 / 后续流程完全沿用原框架
         np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
-                   save_arr, delimiter=',', fmt='%.6f')
+                np.array(self.freeze_data), delimiter=',', fmt='%.6f')
 
-        xyz = np.array(self.freeze_data)[:, :3]
-        pts_cal_unit = ellipsoid_to_sphere(xyz, self.freeze_b, self.freeze_A)
-        # ---- 打印指标 ----
+        pts_cal_unit = (xyz_all - self.freeze_b) * scale
         np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"),
-                   pts_cal_unit, delimiter=',', fmt='%.8f')
+                pts_cal_unit, delimiter=',', fmt='%.8f')
 
         c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
         with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
@@ -513,7 +514,7 @@ class CalibrationApp(QObject):
         self.timer.stop()
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
-        self.window.set_status("3D Three-Step Done")
+        self.window.set_status("3D Three-Step Done (fixed-xy sphere)")
     def view_result_3d(self):
         if self.freeze_data is None:
             return

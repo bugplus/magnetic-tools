@@ -51,6 +51,8 @@ import os
 CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
 os.makedirs(CALIB_DIR, exist_ok=True)
 
+
+
 # -----------------------------
 # 1. 线程安全串口读取（角度门控+稀疏化）
 # -----------------------------
@@ -202,6 +204,25 @@ def draw_unit_sphere(ax, r=1.0):
     rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
     ax.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
 
+
+
+def fit_circle_2d(points_xy):
+    """最小二乘拟合圆，返回圆心(cx,cy)"""
+    x, y = points_xy[:, 0], points_xy[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones_like(x)])
+    b = x**2 + y**2
+    (cx, cy, _), *_ = np.linalg.lstsq(A, b, rcond=None)
+    return np.array([cx, cy], dtype=float)
+
+def fit_sphere_fixed_xy(points_3d, fixed_xy):
+    """固定球心 XY，只估 bz 与半径"""
+    bx, by = fixed_xy
+    x, y, z = points_3d[:, 0], points_3d[:, 1], points_3d[:, 2]
+    A = np.column_stack([-2 * z, np.ones_like(z)])
+    rhs = (x - bx)**2 + (y - by)**2 + z**2
+    (bz, r_sq), *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    radius = np.sqrt(r_sq + bz**2)
+    return np.array([bx, by, bz], dtype=float), radius
 # -----------------------------
 # 3. CalibrationApp
 # -----------------------------
@@ -458,244 +479,116 @@ class CalibrationApp(QObject):
             self.check_timer.stop()
         if self.thread:
             self.thread.stop()
-        if len(self.freeze_data) < MIN_3D_POINTS:
-            self.window.set_status(f"Need ≥{MIN_3D_POINTS} points")
-            return
 
         self.freeze_data = list(self.mag3d_data)
+        xyz = np.array(self.freeze_data)[:, :3]
 
-        # self.freeze_b, self.freeze_A = fit_ellipsoid_3d(self.freeze_data)
-        # xyz = np.array(self.freeze_data)[:, :3]
-        # # 只用 Step 0（水平旋转）数据拟合
-        # step0_xyz = np.array(self.freeze_data)[
-        #     self.step_start_idx[0]:self.step_start_idx[1], :3
-        # ]
-        # self.freeze_b, self.freeze_A = fit_ellipsoid_3d(step0_xyz)
+        if len(xyz) < MIN_3D_POINTS:
+            self.window.set_status("Need ≥{} points".format(MIN_3D_POINTS))
+            return
 
-        # # 强制修正为单位圆（可选：去掉软铁误差）
-        # self.freeze_A = np.eye(3)
-        # ---------- 新 Step 0 逻辑 ----------
-        step0_slice = slice(self.step_start_idx[0], self.step_start_idx[1])
-        step0_chunk = np.array(self.freeze_data)[step0_slice]
+        # --- full ellipsoid fit ---
+        b, A = fit_ellipsoid_3d(xyz)
+        if b is None or A is None:
+            QMessageBox.warning(self.window, "Error", "Ellipsoid fit failed")
+            return
 
-        # 1. 用六轴角度把磁矢量旋到水平面
-        level_xy = np.array([
-            CalibrationApp.rotate_to_level(mx, my, mz, pitch, roll)
-            for mx, my, mz, pitch, roll, *_ in step0_chunk
-        ])
+        # normalize to unit sphere
+        radii = np.linalg.norm((xyz - b) @ A.T, axis=1)
+        scale = 1.0 / np.mean(radii)
+        A *= scale
 
-        # 2. 仅对水平 XY 点拟合正圆 → 返回 (cx, cy)
-        (cx, cy), _ = CalibrationApp.fit_circle_2d(level_xy)
-        self.freeze_b = np.array([cx, cy, 0.0])
-        # 强制软铁为单位阵
-        self.freeze_A = np.eye(3)
-        # ----------------------------------------
-        # ---------- 利用固定圆心 + 全数据拟合球 ----------
-        xyz_all = np.array(self.freeze_data)[:, :3]
-        bx_by = self.freeze_b[:2]              # 固定 Step 0 的 xy
-        self.freeze_b, radius = CalibrationApp.fit_sphere_fixed_xy(xyz_all, bx_by)
+        # save results
+        self.freeze_b = b
+        self.freeze_A = A
 
-        # 统一比例因子：把半径拉到 1
-        scale = 1.0 / radius
-        self.freeze_A = np.eye(3) * scale      # 软铁仍为单位阵，仅整体缩放
+        pts_cal = (xyz - b) @ A.T
+        pts_cal /= np.linalg.norm(pts_cal, axis=1, keepdims=True)
 
-        # 保存 / 打印 / 后续流程完全沿用原框架
         np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
                 np.array(self.freeze_data), delimiter=',', fmt='%.6f')
-
-        pts_cal_unit = (xyz_all - self.freeze_b) * scale
         np.savetxt(os.path.join(CALIB_DIR, "calibrated_mag.csv"),
-                pts_cal_unit, delimiter=',', fmt='%.8f')
+                pts_cal, delimiter=',', fmt='%.8f')
 
-        c_code = generate_c_code_3d(self.freeze_b, np.linalg.inv(self.freeze_A))
-        with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w', encoding='utf-8') as f:
+        c_code = generate_c_code_3d(b, np.linalg.inv(A))
+        with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w') as f:
             f.write(c_code)
 
         self.timer.stop()
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
-        self.window.set_status("3D Three-Step Done (fixed-xy sphere)")
+        self.window.set_status("Ellipsoid calibration OK")
     def view_result_3d(self):
         if self.freeze_data is None:
             return
 
-        from matplotlib.animation import FuncAnimation
+        xyz  = np.array(self.freeze_data)[:, :3]
+        step = np.array(self.freeze_data)[:, -1].astype(int)
 
-        xyz = np.array(self.freeze_data)[:, :3]
-        n = len(xyz)
-        k = n // 3
-        colors = ['#ff0080', '#00e5ff', '#8000FF']
-        labels = ['Level', 'Tilt', 'Stern']
+        pts = (xyz - self.freeze_b) @ self.freeze_A.T
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
 
-        # 重新计算并打印
-        pts_cal_unit = (self.freeze_A @ (xyz - self.freeze_b).T).T
-        pts_cal_unit /= np.linalg.norm(pts_cal_unit, axis=1, keepdims=True)
-        mean_dist = np.mean(np.linalg.norm(pts_cal_unit, axis=1))
-        print("Calibrated unit sphere mean distance:", mean_dist)
+        yaw = np.array(self.freeze_data)[:, 5]
+        yaw = np.where(yaw < 0, yaw + 360, yaw)
 
-        # Raw 3D
-        self.ax3d.clear()
-        for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = xyz[i * k:(i + 1) * k]
-            if len(seg):
-                self.ax3d.scatter(*seg.T, c=c, s=8, label=lab, depthshade=False)
-        self.ax3d.set_title("Raw 3D Mag (μT)")
-        self.ax3d.legend()
-        self.ax3d.set_box_aspect([1, 1, 1])
-        self.canvas3d.draw()
+        # 90-degree coloring for Step-0 only
+        def color90(y):
+            if   0   <= y < 90:   return 'red'
+            elif 90  <= y < 180:  return 'lime'
+            elif 180 <= y < 270:  return 'blue'
+            else:                 return 'magenta'
 
-        # Raw Unit Sphere
-        raw_unit = raw_to_unit(xyz, self.freeze_b)
-        self.ax_raw_sphere.clear()
-        draw_unit_sphere(self.ax_raw_sphere, r=1.0)
-        for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = raw_unit[i * k:(i + 1) * k]
-            if len(seg):
-                self.ax_raw_sphere.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
-        self.ax_raw_sphere.set_title("Raw Unit Sphere")
-        self.ax_raw_sphere.set_box_aspect([1, 1, 1])
-        self.ax_raw_sphere.legend()
-        self.canvas_raw_sphere.draw()
+        step_colors = {0: 'red', 1: 'lime', 2: 'blue'}  # overall step colors
 
-        # Calibrated Unit Sphere
-        self.ax3d_cal.clear()
-        draw_unit_sphere(self.ax3d_cal, r=1.0)
-        for i, (c, lab) in enumerate(zip(colors, labels)):
-            seg = pts_cal_unit[i * k:(i + 1) * k]
-            if len(seg):
-                self.ax3d_cal.scatter(*seg.T, c=c, s=4, label=lab, depthshade=False)
-        self.ax3d_cal.set_title("Calibrated on Unit Sphere")
-        self.ax3d_cal.set_box_aspect([1, 1, 1])
-        self.ax3d_cal.legend()
-        self.canvas3d_cal.draw()
+        fig = plt.figure(figsize=(18, 6))
 
-        # 3D 动画
-        elev = 20
-        self.anim1 = FuncAnimation(self.fig3d, lambda i: self.ax3d.view_init(elev, i % 360), frames=360, interval=50)
-        self.anim2 = FuncAnimation(self.fig_raw_sphere, lambda i: self.ax_raw_sphere.view_init(elev, i % 360), frames=360, interval=50)
-        self.anim3 = FuncAnimation(self.fig3d_cal, lambda i: self.ax3d_cal.view_init(elev, i % 360), frames=360, interval=50)
+        # ---------- 1) Raw 3D ----------
+        ax1 = fig.add_subplot(131, projection='3d')
+        u = np.linspace(0, 2*np.pi, 60)
+        v = np.linspace(0, np.pi, 30)
+        x = np.outer(np.cos(u), np.sin(v))
+        y = np.outer(np.sin(u), np.sin(v))
+        z = np.outer(np.ones_like(u), np.cos(v))
+        ax1.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
+        for s in (0, 1, 2):
+            ax1.scatter(*xyz[step == s].T, c=step_colors[s], s=12, label=f'Step-{s}', depthshade=False)
+        ax1.set_title('Raw Points')
+        ax1.legend()
+        ax1.set_box_aspect([1, 1, 1])
 
-        # XY 平面弹窗（保持不变）
-        dlg2d = QDialog(self.window)
-        dlg2d.setWindowTitle("Calibrated XY Projection")
-        dlg2d.resize(450, 450)
-        layout = QVBoxLayout(dlg2d)
-        fig2d, ax2d = plt.subplots()
-        ax2d.set_aspect('equal')
-        yaws = np.array(self.freeze_data)[:, 5]
-        color_map = {(0, 90): 'r', (90, 180): 'g', (180, 270): 'b', (270, 360): 'm'}
-        for (start, end), color in color_map.items():
-            mask = ((yaws >= start) & (yaws < end)) | ((yaws + 360 >= start) & (yaws + 360 < end))
-            ax2d.scatter(pts_cal_unit[mask, 0], pts_cal_unit[mask, 1], s=4, c=color, label=f'{start}-{end} deg')
-        circle = plt.Circle((0, 0), 1, color='r', fill=False, linestyle='--')
-        ax2d.add_patch(circle)
-        ax2d.set_title("Calibrated XY Plane Projection")
-        ax2d.legend()
-        distances = np.linalg.norm(pts_cal_unit[:, :2], axis=1)
-        ax2d.text(0.02, 0.98,
-                  f"Mean distance: {np.mean(distances):.4f}\n"
-                  f"Std deviation: {np.std(distances):.4f}\n"
-                  f"Circularity error: {np.std(distances)/np.mean(distances):.4f}",
-                  transform=ax2d.transAxes,
-                  verticalalignment='top',
-                  fontsize=10,
-                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        canvas2d = FigureCanvas2D(fig2d)
-        layout.addWidget(canvas2d)
-        dlg2d.setLayout(layout)
-        dlg2d.exec_()
+        # ---------- 2) Calibrated 3D ----------
+        ax2 = fig.add_subplot(132, projection='3d')
+        ax2.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
+        for s in (0, 1, 2):
+            ax2.scatter(*pts[step == s].T, c=step_colors[s], s=12, label=f'Step-{s}', depthshade=False)
+        ax2.set_title('Calibrated on Unit Sphere')
+        ax2.legend()
+        ax2.set_box_aspect([1, 1, 1])
 
-        self.show_step0_angle_distribution_histogram()
-    @staticmethod
-    def angle_color(yaw_vals):
-        colors = np.full(yaw_vals.shape, 'gray', dtype=object)
-        mask0 = (yaw_vals >= 0)   & (yaw_vals < 90)
-        mask1 = (yaw_vals >= 90)  & (yaw_vals < 180)
-        mask2 = (yaw_vals >= 180) & (yaw_vals < 270)
-        mask3 = (yaw_vals >= 270) & (yaw_vals < 360)
-        colors[mask0] = 'red'
-        colors[mask1] = 'green'
-        colors[mask2] = 'blue'
-        colors[mask3] = 'orange'
-        return colors
-    def show_step0_angle_distribution_histogram(self):
-        """显示第一步数据校准前后的XY图，按90°分段着色"""
-        if self.freeze_data is None or self.freeze_b is None or self.freeze_A is None:
-            return
+        # ---------- 3) Step-0 XY projection with 90-degree bands ----------
+        mask0 = step == 0
+        xy_raw = xyz[mask0, :2]
+        xy_cal = pts[mask0, :2]
+        yaw0   = yaw[mask0]
+        c90    = [color90(y) for y in yaw0]
 
-        # 仅取第一步数据
-        step0_data = np.array(self.freeze_data)[
-            self.step_start_idx[0]:self.step_start_idx[1], :3
-        ]
-        mx_raw = step0_data[:, 0]
-        my_raw = step0_data[:, 1]
+        ax3 = fig.add_subplot(133)
+        ax3.scatter(*xy_raw.T, c=c90, s=8, alpha=0.8, label='Raw XY')
+        ax3.scatter(*xy_cal.T, c=c90, s=8, alpha=0.8, label='Cal XY')
+        ax3.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+        ax3.plot(0, 0, 'k+')
+        ax3.set_aspect('equal')
+        ax3.legend()
+        ax3.set_title('Step-0 XY (90-deg bands)')
+        ax3.grid(alpha=0.3)
 
-        # 硬铁 + 软铁校准
-        pts_centered = step0_data - self.freeze_b
-        pts_cal = (self.freeze_A @ pts_centered.T).T
-        norm = np.linalg.norm(pts_cal, axis=1, keepdims=True)
-        norm = np.where(norm < 1e-6, 1, norm)
-        pts_cal_unit = pts_cal / norm
-        cal_mx = pts_cal_unit[:, 0]
-        cal_my = pts_cal_unit[:, 1]
-
-        # 直接用 step0 的 yaw 值着色
-        step0_yaw = np.array(self.freeze_data)[
-            self.step_start_idx[0]:self.step_start_idx[1], 5
-        ]
-        colors_raw = self.angle_color(step0_yaw)
-        colors_cal = self.angle_color(step0_yaw)
-
-        # 绘制
-        dlg_xy = QDialog(self.window)
-        dlg_xy.setWindowTitle("Step 0 XY Projection (90° Segments)")
-        dlg_xy.resize(1200, 600)
-        layout = QVBoxLayout(dlg_xy)
-
-        fig_xy, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-
-        # 原始
-        ax1.scatter(mx_raw, my_raw, s=20, c=colors_raw, alpha=0.7)
-        circle1 = plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1)
-        ax1.add_patch(circle1)
-        ax1.plot(0, 0, 'k+')
-        ax1.axhline(0, color='black', linewidth=1.5)
-        ax1.axvline(0, color='black', linewidth=1.5)
-        ax1.set_aspect('equal')
-        ax1.set_title("Step 0 Raw Data (90° Segments)")
-        ax1.set_xlabel("Raw MX")
-        ax1.set_ylabel("Raw MY")
-        ax1.grid(True, alpha=0.3)
-
-        # 校准后
-        ax2.scatter(cal_mx, cal_my, s=20, c=colors_cal, alpha=0.7)
-        circle2 = plt.Circle((0, 0), 1, color='black', fill=False, ls='--', lw=1)
-        ax2.add_patch(circle2)
-        ax2.plot(0, 0, 'k+')
-        ax2.axhline(0, color='black', linewidth=1.5)
-        ax2.axvline(0, color='black', linewidth=1.5)
-        ax2.set_aspect('equal')
-        ax2.set_title("Step 0 Calibrated Data (90° Segments)")
-        ax2.set_xlabel("Calibrated MX")
-        ax2.set_ylabel("Calibrated MY")
-        ax2.grid(True, alpha=0.3)
-
-        # 统计
-        distances_raw = np.sqrt(mx_raw**2 + my_raw**2)
-        distances_cal = np.sqrt(cal_mx**2 + cal_my**2)
-        stats_txt = (
-            f"Raw:  Mean={np.mean(distances_raw):.3f}, Std={np.std(distances_raw):.3f}\n"
-            f"Cal:  Mean={np.mean(distances_cal):.3f}, Std={np.std(distances_cal):.3f}"
-        )
-        fig_xy.suptitle(stats_txt, fontsize=12)
-
-        plt.tight_layout()
-        canvas_xy = FigureCanvas2D(fig_xy)
-        layout.addWidget(canvas_xy)
-        dlg_xy.setLayout(layout)
-        dlg_xy.exec_()
-
-
+        dlg = QDialog(self.window)
+        dlg.setWindowTitle('Step-0 90-degree View')
+        dlg.resize(1400, 600)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(FigureCanvas(fig))
+        dlg.setLayout(layout)
+        dlg.exec_()
     @pyqtSlot()
     def on_algo3d(self):
         fname, _ = QFileDialog.getOpenFileName(
@@ -747,7 +640,8 @@ class CalibrationApp(QObject):
             for ax, title, pts in [(ax_raw, "Raw Unit Sphere", pts_raw_unit),
                                    (ax_cal, "Calibrated Unit Sphere", pts_cal_unit)]:
                 draw_unit_sphere(ax, 1.0)
-                for s, c, lab in [(0, '#ff0080', 'Step0'),
+                # 修改颜色：Step0 改为显眼的亮红色 #FF0000
+                for s, c, lab in [(0, '#FF0000', 'Step0'),  # 水平数据，亮红色
                                   (1, '#00e5ff', 'Step1'),
                                   (2, '#8000FF', 'Step2')]:
                     seg = pts[step_id == s]

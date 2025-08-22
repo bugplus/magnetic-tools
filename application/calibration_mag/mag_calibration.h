@@ -1,7 +1,7 @@
-/* 3-step mag calibration (fixed XY center, optimize z & radius) */
-const float HARD_IRON[3] = {-331.95855668f, 198.31643286f, 132.36440436f};
+/* 3-step mag calibration (Step-0 forced circle, sphere axis through circle center) */
+const float HARD_IRON[3] = {14.49048302f, -2479.70468560f, -6655.35127283f};
 const float SOFT_IRON[3][3] = {
-  {0.00370687f, 0.0f, 0.0f},
-  {0.0f, 0.00370687f, 0.0f},
-  {0.0f, 0.0f, 0.00370687f}
+  {0.00096206f, 0.0f, 0.0f},
+  {0.0f, 0.00096206f, 0.0f},
+  {0.0f, 0.0f, 0.00096206f}
 };

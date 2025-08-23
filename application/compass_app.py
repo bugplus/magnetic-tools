@@ -339,6 +339,8 @@ class CalibrationApp(QObject):
         self.freeze_data = None
         self.freeze_b = None
         self.freeze_A = None
+        self.final_b = None          # <- 新增
+        self.final_A = None          # <- 新增
         self.timer = QTimer()
         self.timer.timeout.connect(self._update_3d_plot_safe)
         self.timer.start(50)
@@ -505,73 +507,125 @@ class CalibrationApp(QObject):
     # -----------------------------------------------------------
     # 统一替换后的 finish_steps
     # -----------------------------------------------------------
+    # -----------------------------------------------------------
+    # 统一替换后的 finish_steps
+    # -----------------------------------------------------------
     def finish_steps(self):
+        """
+        1. 只用 Step-0 水平点求圆心 (bx, by)
+        2. 固定 (bx, by) 用全部三步 3D 点拟合球：优化 bz 与半径 r
+        3. 每一步数据带颜色，Step-0 每 90° 一个颜色
+        """
         if self.check_timer is not None:
             self.check_timer.stop()
         if hasattr(self, 'thread') and self.thread:
             self.thread.stop()
 
-        raw = np.array(self.mag3d_data)
-        xyz = raw[:, :3]
-        stepid = raw[:, -1].astype(int)
+        # ---------- 准备 ----------
+        raw = np.array(self.freeze_data)
+        xyz_all = raw[:, :3]                      # (N,3) 原始磁场
+        stepid = raw[:, -1].astype(int)           # (N,)  对应步骤 0/1/2
+        yaw_all = raw[:, 5]                       # 用于 Step-0 分色
+        yaw_all = np.where(yaw_all < 0, yaw_all + 360, yaw_all)
 
-        # ---------- Step-0 强制正圆 ----------
+                # ---------- 1. 只用 Step-0 水平点求 (bx, by) ----------
         mask0 = stepid == 0
         step0 = raw[mask0]
-        xy_raw = step0[:, :2]
-        xy = np.array([
+        xy_level = np.array([
             self.rotate_to_level(mx, my, mz, p, r)
-            for mx, my, mz, p, r
-            in zip(step0[:, 0], step0[:, 1], step0[:, 2],
-                   step0[:, 3], step0[:, 4])
+            for mx, my, mz, p, r in zip(step0[:, 0], step0[:, 1], step0[:, 2],
+                                        step0[:, 3], step0[:, 4])
         ])
+        bx, by = self.fit_circle_2d(xy_level)
 
-        # 椭圆→正圆矩阵
-        xy -= xy.mean(axis=0)
-        A = np.c_[xy[:, 0]**2, xy[:, 0]*xy[:, 1], xy[:, 1]**2]
-        a, b_, c = np.linalg.lstsq(A, np.ones(len(xy)), rcond=None)[0]
-        Q = np.array([[a, b_/2], [b_/2, c]])
-        w, V = np.linalg.eigh(Q)
-        M = V @ np.diag(1/np.sqrt(w)) @ V.T
-        xy_circle = xy @ M.T
-        fixed_xy = xy_circle.mean(axis=0) + xy_raw.mean(axis=0)
+        # ---------- 2. 固定 (bx, by) 拟合球 ----------
+        center, radius = self.fit_sphere_fixed_xy(xyz_all, [bx, by])
+        bias = center
+        scale = 1.0 / radius
+        soft = np.eye(3) * scale
 
-        # 固定圆心求半径
-        b_all, r_all = self.fit_sphere_fixed_xy(xyz, fixed_xy)
-        bias = b_all
-        scale_all = 1.0 / r_all
-        soft = np.eye(3) * scale_all
+        # ---------- 3. 让 Step-0 XY 圆心归零 ----------
+        mask0 = stepid == 0
+        xy_cal0 = (xyz_all[mask0] - bias) @ soft.T
+        dxy = xy_cal0[:, :2].mean(axis=0)
+        bias[:2] += np.linalg.solve(soft[:2, :2], dxy)   # 只平移 XY
 
-        # 保存
-        os.makedirs(CALIB_DIR, exist_ok=True)
-        raw_file = os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv")
-        if os.path.exists(raw_file):
-            os.remove(raw_file)
-        np.savetxt(raw_file, raw, delimiter=',', fmt='%.6f')
+        # ---------- 4. 保存 & 供 Algo3D 复用 ----------
+        self.final_b = bias
+        self.final_A = soft
 
-        pts_cal = (xyz - bias) * scale_all
-        cal_file = os.path.join(CALIB_DIR, "calibrated_mag.csv")
-        if os.path.exists(cal_file):
-            os.remove(cal_file)
-        np.savetxt(cal_file, pts_cal, delimiter=',', fmt='%.8f')
-
-        c_code = (
-            f"const float HARD_IRON[3] = {{{bias[0]:.6f}f, {bias[1]:.6f}f, {bias[2]:.6f}f}};\n"
-            f"const float SOFT_IRON[3][3] = {{\n"
-            f"  {{{scale_all:.6f}f, 0.0f, 0.0f}},\n"
-            f"  {{0.0f, {scale_all:.6f}f, 0.0f}},\n"
-            f"  {{0.0f, 0.0f, {scale_all:.6f}f}}\n"
-            "}};"
-        )
+        c_code = generate_c_code_3d(bias, soft)
         with open(os.path.join(CALIB_DIR, "mag_calibration.h"), 'w') as f:
             f.write(c_code)
 
+        # ---------- 4. 3D 可视化 ----------
         self.timer.stop()
         self.window.show_result_dialog(c_code)
         self.window.enable_view3d_btn(True)
         self.freeze_b = bias
         self.freeze_A = soft
-        self.window.set_status("Step-0 forced circle ✓")
+        # 供 Algo3D 直接复用
+        self.final_b = bias
+        self.final_A = soft
+        self.window.set_status("Calibration finished ✓")
+
+        # ---------- 5. 生成带颜色的 3D 图 ----------
+        fig = plt.figure(figsize=(18, 6))
+
+        # 1) Raw 3D
+        ax1 = fig.add_subplot(131, projection='3d')
+        u = np.linspace(0, 2 * np.pi, 60)
+        v = np.linspace(0, np.pi, 30)
+        x = np.outer(np.cos(u), np.sin(v))
+        y = np.outer(np.sin(u), np.sin(v))
+        z = np.outer(np.ones_like(u), np.cos(v))
+        ax1.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
+        step_colors = {0: '#FF0000', 1: '#00E5FF', 2: '#8000FF'}
+        for s in (0, 1, 2):
+            ax1.scatter(*xyz_all[stepid == s].T, c=step_colors[s], s=12,
+                        label=f'Step-{s}', depthshade=False)
+        ax1.set_title('Raw Points')
+        ax1.legend()
+        ax1.set_box_aspect([1, 1, 1])
+
+        # 2) Calibrated 3D
+        ax2 = fig.add_subplot(132, projection='3d')
+        ax2.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
+        for s in (0, 1, 2):
+            ax2.scatter(*pts_cal[stepid == s].T, c=step_colors[s], s=12,
+                        label=f'Step-{s}', depthshade=False)
+        ax2.set_title('Calibrated on Unit Sphere')
+        ax2.legend()
+        ax2.set_box_aspect([1, 1, 1])
+
+        # 3) Step-0 XY 投影，每 90° 一个颜色
+        xy_raw0 = xyz_all[mask0, :2]
+        xy_cal0 = pts_cal[mask0, :2]
+        yaw0 = yaw_all[mask0]
+
+        def color90(y):
+            return ['red', 'green', 'blue', 'orange'][
+                int(y) // 90 % 4]
+
+        c90 = [color90(y) for y in yaw0]
+
+        ax3 = fig.add_subplot(133)
+        ax3.scatter(*xy_raw0.T, c=c90, s=8, alpha=0.8, label='Raw XY')
+        ax3.scatter(*xy_cal0.T, c=c90, s=8, alpha=0.8, label='Cal XY')
+        ax3.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+        ax3.plot(0, 0, 'k+')
+        ax3.set_aspect('equal')
+        ax3.legend()
+        ax3.set_title('Step-0 XY (90-deg bands)')
+        ax3.grid(alpha=0.3)
+
+        dlg = QDialog(self.window)
+        dlg.setWindowTitle('Calibration Result – 3D View')
+        dlg.resize(1400, 600)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(FigureCanvas(fig))
+        dlg.setLayout(layout)
+        dlg.exec_()
     def view_result_3d(self):
         if self.freeze_data is None:
             return
@@ -670,35 +724,24 @@ class CalibrationApp(QObject):
             if raw_all.shape[1] < 7:
                 raise ValueError("CSV 至少 7 列，最后一列为 step_id")
 
-            xyz_all = raw_all[:, :3]          # 原始磁场
+            xyz_all = raw_all[:, :3]
             step_id = raw_all[:, -1].astype(int)
 
-            # ---------- 1. 椭球拟合 ----------
+            # ✅ 直接从原始数据计算校准参数（不依赖外部）
             b, A = fit_ellipsoid_3d(xyz_all)
             if b is None or A is None:
-                raise ValueError("椭球拟合失败")
+                raise ValueError("椭球拟合失败，数据不足或质量差")
 
-            # ---------- 2. 校准 ----------
+            # ✅ 应用校准
             pts_cal = ellipsoid_to_sphere(xyz_all, b, A)
-           # ---------- 额外硬铁补偿：让 XY 圆心归零 ----------
-            xy_cal0 = pts_cal[step_id == 0, :2]          # Step-0 的 XY
-            xy_center = xy_cal0.mean(axis=0)             # 当前圆心 (2,)
-            # 把 XY 偏差映射回原始坐标系
-            b[:2] += np.linalg.solve(A[:2, :2], xy_center)  # 只取 XY 子矩阵
-            pts_cal = ellipsoid_to_sphere(xyz_all, b, A)    # 重新校准
-            # ---------- 用全部数据重新精确求球心 ----------
-           # ---------- 用全部数据重新精确求球心 ----------
-            center_fix, _ = fit_sphere_fixed_xy(pts_cal, [0.0, 0.0])  # center_fix = [0,0,bz]
-            b += center_fix                       # 直接把真正球心平移回去
-            pts_cal = ellipsoid_to_sphere(xyz_all, b, A)  # 再次校准
-            # ---------- 3. 3D 总览 ----------
+
+            # ---------- 3D 总览 ----------
             fig = plt.figure(figsize=(12, 5))
             ax_raw = fig.add_subplot(121, projection='3d')
             ax_cal = fig.add_subplot(122, projection='3d')
 
             for ax, pts, title in [(ax_raw, xyz_all, "Raw"),
                                 (ax_cal, pts_cal, "Calibrated")]:
-                # 画单位球框架
                 u = np.linspace(0, 2*np.pi, 60)
                 v = np.linspace(0, np.pi, 30)
                 x = np.outer(np.cos(u), np.sin(v))
@@ -706,7 +749,6 @@ class CalibrationApp(QObject):
                 z = np.outer(np.ones_like(u), np.cos(v))
                 ax.plot_wireframe(x, y, z, color='gray', alpha=0.2)
 
-                # 分步染色
                 colors = ['#FF0000', '#00E5FF', '#8000FF']
                 for s in (0, 1, 2):
                     seg = pts[step_id == s]
@@ -724,76 +766,55 @@ class CalibrationApp(QObject):
             dlg3d.setLayout(lay3d)
             dlg3d.exec_()
 
-            # ---------- 4. Step-0 XY 90° 分色 ----------
+            # ---------- Step-0 XY 90° 分色 ----------
             mask0 = step_id == 0
-            if not np.any(mask0):
-                raise ValueError("无 Step-0 数据")
+            if np.any(mask0):
+                xy_raw0 = xyz_all[mask0, :2]
+                xy_cal0 = pts_cal[mask0, :2]
+                yaw0 = raw_all[mask0, 5]
+                yaw0 = np.where(yaw0 < 0, yaw0 + 360, yaw0)
 
-            xy_raw0 = xyz_all[mask0, :2]
-            xy_cal0 = pts_cal[mask0, :2]
-            yaw0 = raw_all[mask0, 5]
-            yaw0 = np.where(yaw0 < 0, yaw0 + 360, yaw0)
+                def color90(y):
+                    return ['red', 'green', 'blue', 'orange'][int(y)//90 % 4]
 
-            def color90(y):
-                if 0 <= y < 90:
-                    return 'red'
-                elif 90 <= y < 180:
-                    return 'green'
-                elif 180 <= y < 270:
-                    return 'blue'
-                else:
-                    return 'orange'
+                dlgxy = QDialog(self.window)
+                dlgxy.setWindowTitle("Step0 XY – Algo3D")
+                dlgxy.resize(1000, 450)
+                figxy, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 
-            c90 = [color90(y) for y in yaw0]
+                for ax, pts, title in [(ax1, xy_raw0, "Raw"),
+                                    (ax2, xy_cal0, "Calibrated")]:
+                    for col, (s, e) in [('red', (0, 90)),
+                                        ('green', (90, 180)),
+                                        ('blue', (180, 270)),
+                                        ('orange', (270, 360))]:
+                        mask = (yaw0 >= s) & (yaw0 < e)
+                        ax.scatter(pts[mask, 0], pts[mask, 1],
+                                s=8, c=col, alpha=0.7, label=f'{s}-{e}°')
+                    cx, cy = fit_circle_2d(pts)
+                    ax.plot(cx, cy, '*r', ms=14, mew=1, mec='white',
+                            label=f'Center ({cx:.3f}, {cy:.3f})')
+                    ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+                    ax.plot(0, 0, 'k+')
+                    ax.set_aspect('equal')
+                    ax.set_title(title)
+                    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), frameon=False, fontsize=9)
+                    ax.grid(alpha=0.3)
 
-            dlgxy = QDialog(self.window)
-            dlgxy.setWindowTitle("Step0 XY – Algo3D")
-            dlgxy.resize(1000, 450)
-            figxy, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+                    # 指标
+                    d = np.linalg.norm(pts, axis=1)
+                    mean, std = d.mean(), d.std()
+                    ax.text(0.02, 0.98,
+                            f"Mean={mean:.4f}\nStd={std:.4f}\nCircErr={std/mean:.4f}",
+                            transform=ax.transAxes, va='top',
+                            bbox=dict(boxstyle='round', fc='white', alpha=0.8))
 
-            for ax, pts, title in [(ax1, xy_raw0, "Raw"),
-                                   (ax2, xy_cal0, "Calibrated")]:
-                # 90° 分色散点
-                for col, (s, e) in [('red', (0, 90)),
-                                      ('green', (90, 180)),
-                                      ('blue', (180, 270)),
-                                      ('orange', (270, 360))]:
-                    mask = (yaw0 >= s) & (yaw0 < e)
-                    ax.scatter(pts[mask, 0], pts[mask, 1],
-                               s=8, c=col, alpha=0.7, label=f'{s}-{e}°')
-
-                # 圆心大红星
-                # cx, cy = pts.mean(axis=0)
-                cx, cy = fit_circle_2d(pts)
-                ax.plot(cx, cy, '*r', markersize=14,
-                        markeredgecolor='white', markeredgewidth=1,
-                        label=f'Center ({cx:.3f}, {cy:.3f})')
-
-                # 参考单位圆
-                ax.add_patch(plt.Circle((0, 0), 1, color='k',
-                                        fill=False, ls='--', lw=1.5))
-                ax.plot(0, 0, 'k+')
-                ax.set_aspect('equal')
-                ax.set_title(title)
-                ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1),
-                          frameon=False, fontsize=9)
-                ax.grid(alpha=0.3)
-
-                # 指标
-                d = np.linalg.norm(pts, axis=1)
-                mean, std = d.mean(), d.std()
-                ax.text(0.02, 0.98,
-                        f"Mean={mean:.4f}\nStd={std:.4f}\nCircErr={std/mean:.4f}",
-                        transform=ax.transAxes,
-                        va='top',
-                        bbox=dict(boxstyle='round', fc='white', alpha=0.8))
-
-            plt.tight_layout()
-            canvasxy = FigureCanvas(figxy)
-            layxy = QVBoxLayout(dlgxy)
-            layxy.addWidget(canvasxy)
-            dlgxy.setLayout(layxy)
-            dlgxy.exec_()
+                plt.tight_layout()
+                canvasxy = FigureCanvas(figxy)
+                layxy = QVBoxLayout(dlgxy)
+                layxy.addWidget(canvasxy)
+                dlgxy.setLayout(layxy)
+                dlgxy.exec_()
 
         except Exception as e:
             QMessageBox.critical(self.window, "Error", str(e))

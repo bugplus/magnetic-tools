@@ -54,37 +54,26 @@ os.makedirs(CALIB_DIR, exist_ok=True)
 # ------------------------------------------------------------------
 def run_sphere_calibration_algorithm(xyz_all: np.ndarray,
                                      step_id: np.ndarray) -> tuple:
-    """
-    Step0 强制 XY 圆心为 (0,0)，再用全数据求半径 & bz
-    返回 (bias, A, pts_cal)
-    """
     from numpy.linalg import lstsq
 
-    # 1. Step0 数据
+    # 1. Step0 拟合正圆 → 圆心(cx,cy)
     mask0 = step_id == 0
-    if not np.any(mask0):
-        raise ValueError("缺少 Step-0 数据")
-
     xy0 = xyz_all[mask0, :2]
     x, y = xy0[:, 0], xy0[:, 1]
+    cx, cy, _ = lstsq(np.c_[2*x, 2*y, np.ones_like(x)],
+                      x**2 + y**2, rcond=None)[0]
 
-    # 2. 强制 XY 圆心 (0,0) → 直接把 bx, by 设为 0
-    bx, by = 0.0, 0.0
-
-    # 3. 用全部数据固定 bx,by 后求 bz 与半径
-    A_sphere = np.column_stack([-2 * xyz_all[:, 2], np.ones(len(xyz_all))])
-    rhs = (xyz_all[:, 0] - bx)**2 + \
-          (xyz_all[:, 1] - by)**2 + \
-          xyz_all[:, 2]**2
-    (bz, r_sq), *_ = lstsq(A_sphere, rhs, rcond=None)
+    # 2. 固定(cx,cy) 求 bz & 半径
+    A_sphere = np.c_[-2*xyz_all[:, 2], np.ones(len(xyz_all))]
+    rhs = (xyz_all[:, 0]-cx)**2 + (xyz_all[:, 1]-cy)**2 + xyz_all[:, 2]**2
+    bz, r_sq = lstsq(A_sphere, rhs, rcond=None)[0]
     radius = np.sqrt(r_sq + bz**2)
 
-    # 4. 生成校准参数
-    bias = np.array([bx, by, bz], dtype=float)
-    A = np.eye(3) / radius           # 各向同性缩放
-    pts_cal = (xyz_all - bias) @ A.T
+    # 3. 生成参数
+    bias = np.array([cx, cy, bz])
+    A = np.eye(3) / radius
+    pts_cal = (xyz_all - bias) @ A      # ← 关键修复
     return bias, A, pts_cal
-
 def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=None):
     import matplotlib.pyplot as plt
     from PyQt5.QtWidgets import QDialog, QVBoxLayout
@@ -733,8 +722,8 @@ class CalibrationApp(QObject):
             print(f"[DEBUG] 原始形状 {raw.shape}")
             print(f"[DEBUG] 原始前3行\n{raw[:3]}")
 
-            if raw.shape[1] != 8:
-                raise ValueError(f"CSV 必须 8 列，当前 {raw.shape[1]} 列")
+            if raw.shape[1] not in (8, 9):
+                raise ValueError(f"CSV 必须是 8 或 9 列，当前 {raw.shape[1]} 列")
 
             # ✅ 正确提取数据
             xyz_all = raw[:, 0:3]

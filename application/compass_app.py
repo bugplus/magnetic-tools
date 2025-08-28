@@ -56,98 +56,125 @@ def run_sphere_calibration_algorithm(xyz_all: np.ndarray,
                                      step_id: np.ndarray) -> tuple:
     from numpy.linalg import lstsq
 
-    # 1. Step0 拟合正圆 → 圆心(cx,cy)
+    # 1. Step0 XY 圆心
     mask0 = step_id == 0
     xy0 = xyz_all[mask0, :2]
-    x, y = xy0[:, 0], xy0[:, 1]
-    cx, cy, _ = lstsq(np.c_[2*x, 2*y, np.ones_like(x)],
-                      x**2 + y**2, rcond=None)[0]
+    cx, cy, _ = lstsq(np.c_[2*xy0[:,0], 2*xy0[:,1], np.ones(len(xy0))],
+                      xy0[:,0]**2 + xy0[:,1]**2, rcond=None)[0]
 
-    # 2. 固定(cx,cy) 求 bz & 半径
-    A_sphere = np.c_[-2*xyz_all[:, 2], np.ones(len(xyz_all))]
-    rhs = (xyz_all[:, 0]-cx)**2 + (xyz_all[:, 1]-cy)**2 + xyz_all[:, 2]**2
-    bz, r_sq = lstsq(A_sphere, rhs, rcond=None)[0]
+    # 2. 固定(cx,cy) 求 bz
+    A_z = np.c_[-2*xyz_all[:,2], np.ones(len(xyz_all))]
+    rhs = (xyz_all[:,0]-cx)**2 + (xyz_all[:,1]-cy)**2 + xyz_all[:,2]**2
+    bz, r_sq = lstsq(A_z, rhs, rcond=None)[0]
     radius = np.sqrt(r_sq + bz**2)
 
-    # 3. 生成参数
-    bias = np.array([cx, cy, bz])
-    A = np.eye(3) / radius
-    pts_cal = (xyz_all - bias) @ A      # ← 关键修复
+    # 3. 一步平移 + 缩放
+    bias = np.array([cx, cy, bz])          # 球心
+    A = np.eye(3) / radius                 # 整体缩放到半径 1
+    pts_cal = (xyz_all - bias) @ A         # 先平移再缩放
+
+    # 4. 确保 Step0 XY 圆心再平移到 0,0
+    xy_cal0 = pts_cal[mask0, :2]
+    cx_cal, cy_cal, _ = lstsq(np.c_[2*xy_cal0[:,0], 2*xy_cal0[:,1], np.ones(len(xy_cal0))],
+                              xy_cal0[:,0]**2 + xy_cal0[:,1]**2, rcond=None)[0]
+    # 二次平移仅作用于 XY
+    pts_cal[:, :2] -= [cx_cal, cy_cal]
+
+    # 5. 更新 bias
+    bias[:2] += np.array([cx_cal, cy_cal]) * radius  # 把二次平移映射回原坐标
     return bias, A, pts_cal
 def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=None):
+    """
+    两幅图：
+    1. Raw 3D 与 Calibrated 3D 并排
+    2. Step-0 XY Raw 与 Calibrated 并排
+    """
     import matplotlib.pyplot as plt
     from PyQt5.QtWidgets import QDialog, QVBoxLayout
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.colors import LightSource
 
-    def color90(y):
-        return ['red', 'green', 'blue', 'orange'][int(y) // 90 % 4]
+    colors = ['#FF0000', '#00E5FF', '#8000FF']
 
-    # 只保留 Step-0 数据
-    mask0 = step_id == 0
-    xy_raw0 = xyz_raw[mask0, :2]
-    yaw0 = yaw_raw[mask0]          # ← 关键：只对 Step-0 的 yaw
-    c90 = [color90(y) for y in yaw0]
+    # --------------------------------------------------
+    # 图1：3D 对比
+    # --------------------------------------------------
+    fig3d = plt.figure(figsize=(16, 8))
 
-    # Step-0 圆心
-    M = np.column_stack([2 * xy_raw0[:, 0],
-                         2 * xy_raw0[:, 1],
-                         np.ones_like(xy_raw0[:, 0])])
-    cx, cy, _ = np.linalg.lstsq(M, xy_raw0[:, 0]**2 + xy_raw0[:, 1]**2, rcond=None)[0]
-
-    fig = plt.figure(figsize=(18, 6))
-
-    # 3D Raw
-    ax1 = fig.add_subplot(131, projection='3d')
-    u, v = np.linspace(0, 2 * np.pi, 60), np.linspace(0, np.pi, 30)
-    x = np.outer(np.cos(u), np.sin(v))
-    y = np.outer(np.sin(u), np.sin(v))
-    z = np.outer(np.ones_like(u), np.cos(v))
+    # Raw 3D
+    ax1 = fig3d.add_subplot(121, projection='3d')
+    cx_raw, cy_raw, cz_raw = xyz_raw.mean(axis=0)
+    u = np.linspace(0, 2 * np.pi, 60)
+    v = np.linspace(0, np.pi, 30)
+    x = cx_raw + np.outer(np.cos(u), np.sin(v))
+    y = cy_raw + np.outer(np.sin(u), np.sin(v))
+    z = cz_raw + np.outer(np.ones_like(u), np.cos(v))
     ls = LightSource(azdeg=45, altdeg=45)
     rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
     ax1.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
-    colors = ['#FF0000', '#00E5FF', '#8000FF']
     for s in (0, 1, 2):
         ax1.scatter(*xyz_raw[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
     ax1.set_title('Raw 3D Mag')
     ax1.legend()
     ax1.set_box_aspect([1, 1, 1])
 
-    # 3D Calibrated
-    ax2 = fig.add_subplot(132, projection='3d')
-    ax2.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
+    # --------- Calibrated 3D（真正缩放到半径 1） ----------
+    ax2 = fig3d.add_subplot(122, projection='3d')
+
+    # 1. 以原点为中心、半径 1 的单位球
+    u = np.linspace(0, 2 * np.pi, 60)
+    v = np.linspace(0, np.pi, 30)
+    x = np.outer(np.cos(u), np.sin(v))
+    y = np.outer(np.sin(u), np.sin(v))
+    z = np.outer(np.ones_like(u), np.cos(v))
+    ls = LightSource(azdeg=45, altdeg=45)
+    rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
+    ax2.plot_surface(x, y, z, facecolors=rgb, alpha=0.3, shade=True, antialiased=True)
+
+    # 2. 把校准后的数据真正缩放到单位球
+    radii = np.linalg.norm(xyz_cal, axis=1, keepdims=True)
+    radii[radii == 0] = 1
+    xyz_unit = xyz_cal / radii          # ← 关键：归一化到半径 1
     for s in (0, 1, 2):
-        ax2.scatter(*xyz_cal[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
-    ax2.set_title('Calibrated on Unit Sphere')
+        ax2.scatter(*xyz_unit[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
+
+    ax2.set_title('Calibrated on Unit Sphere (radius=1)')
     ax2.legend()
     ax2.set_box_aspect([1, 1, 1])
 
-    # Step-0 XY 90°分色（只画 Step-0）
-    ax3 = fig.add_subplot(133)
-    xy_cal0 = xyz_cal[mask0, :2]
-    for col, (start, end) in [('red', (0, 90)), ('green', (90, 180)),
-                              ('blue', (180, 270)), ('orange', (270, 360))]:
-        mask = (yaw0 >= start) & (yaw0 < end)
-        ax3.scatter(xy_raw0[mask, 0], xy_raw0[mask, 1],
-                    s=8, c=col, alpha=0.7, label=f'{start}-{end}° raw')
-        ax3.scatter(xy_cal0[mask, 0], xy_cal0[mask, 1],
-                    marker='x', s=8, c=col, alpha=0.7, label=f'{start}-{end}° cal')
-    ax3.scatter(cx, cy, marker='*', color='k', s=100,
-                label=f'Center ({cx:.3f},{cy:.3f})')
-    ax3.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
-    ax3.plot(0, 0, 'k+')
-    ax3.set_aspect('equal')
-    ax3.set_title('Step-0 XY – 90° bands')
-    ax3.legend()
-    ax3.grid(alpha=0.3)
+    dlg3d = QDialog(parent)
+    dlg3d.setWindowTitle('3D Comparison')
+    dlg3d.resize(1600, 800)
+    QVBoxLayout(dlg3d).addWidget(FigureCanvas(fig3d))
+    dlg3d.exec_()
 
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("Sphere Calibration Result")
-    dlg.resize(1400, 600)
-    layout = QVBoxLayout(dlg)
-    layout.addWidget(FigureCanvas(fig))
-    dlg.setLayout(layout)
-    dlg.exec_()
+    # --------------------------------------------------
+    # 图2：Step-0 XY 对比
+    # --------------------------------------------------
+    mask0 = step_id == 0
+    xy_raw0 = xyz_raw[mask0, :2]
+    xy_cal0 = xyz_cal[mask0, :2]
+
+    fig_xy = plt.figure(figsize=(12, 6))
+    ax_raw = fig_xy.add_subplot(121, aspect='equal')
+    ax_raw.scatter(*xy_raw0.T, s=8, c='b', label='Raw')
+    ax_raw.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+    ax_raw.set_title('Step-0 XY Raw')
+    ax_raw.legend()
+    ax_raw.grid(alpha=0.3)
+
+    ax_cal = fig_xy.add_subplot(122, aspect='equal')
+    ax_cal.scatter(*xy_cal0.T, s=8, c='r', label='Calibrated')
+    ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+    ax_cal.set_title('Step-0 XY Calibrated')
+    ax_cal.legend()
+    ax_cal.grid(alpha=0.3)
+
+    dlg_xy = QDialog(parent)
+    dlg_xy.setWindowTitle('Step-0 XY Comparison')
+    dlg_xy.resize(1200, 600)
+    QVBoxLayout(dlg_xy).addWidget(FigureCanvas(fig_xy))
+    dlg_xy.exec_()
 def step0_force_circle(step0_xyz: np.ndarray):
     """仅用 Step0 水平数据 → 强制拉圆 → 返回圆心(bx,by) 和 缩放因子"""
     xy = step0_xyz[:, :2]
@@ -684,6 +711,14 @@ class CalibrationApp(QObject):
         ax2.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
         for s in (0, 1, 2):
             ax2.scatter(*pts_cal[step == s].T, c=step_colors[s], s=12, label=f'Step-{s}', depthshade=False)
+        # ↓↓↓ 直接插到这三行 ↓↓↓
+        ax2.set_xlim(-1.2, 1.2)
+        ax2.set_ylim(-1.2, 1.2)
+        ax2.set_zlim(-1.2, 1.2)
+        # ↑↑↑ 直接插到这三行 ↑↑↑
+        # ↓↓↓ 新增两行：拉远视角 + 关闭深度隐藏
+        ax2.dist = 8                    # 把相机拉远
+        ax2.set_box_aspect([1, 1, 1])   # 保持等比例
         ax2.set_title('Calibrated on Unit Sphere')
         ax2.legend()
         ax2.set_box_aspect([1, 1, 1])

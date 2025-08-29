@@ -749,34 +749,35 @@ class CalibrationApp(QObject):
         dlg.exec_()
     @pyqtSlot()
     def on_algo3d(self):
-        fname, _ = QFileDialog.getOpenFileName(self.window, "Select CSV", CALIB_DIR, "CSV (*.csv)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self.window, "Select CSV", CALIB_DIR, "CSV (*.csv)")
         if not fname:
             return
+
         try:
             raw = np.loadtxt(fname, delimiter=',', ndmin=2)
-            print(f"[DEBUG] 原始形状 {raw.shape}")
-            print(f"[DEBUG] 原始前3行\n{raw[:3]}")
-
             if raw.shape[1] not in (8, 9):
-                raise ValueError(f"CSV 必须是 8 或 9 列，当前 {raw.shape[1]} 列")
+                raise ValueError(f"CSV must be 8 or 9 columns, got {raw.shape[1]}")
 
-            # ✅ 正确提取数据
+            # 1. 解析数据
             xyz_all = raw[:, 0:3]
             step_id = raw[:, 7].astype(int)
             yaw_all = raw[:, 5]
 
-            # ✅ 强制长度一致检查
-            assert len(xyz_all) == len(step_id) == len(yaw_all), \
-                f"行数不一致：xyz={len(xyz_all)}  step={len(step_id)}  yaw={len(yaw_all)}"
-
-            # ✅ 运行校准算法
+            # 2. 运行校准算法
             bias, A, pts_cal = run_sphere_calibration_algorithm(xyz_all, step_id)
 
-            # ✅ 显示标准图
+            # 3. 生成并保存 C 文件
+            c_code = generate_c_code_3d(bias, A)
+            c_path = os.path.join(CALIB_DIR, "mag_calib_3d.c")
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            # 4. 显示结果图
             plot_standard_calibration_result(
                 xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
 
-            # ✅ 显示 Step-0 校准后的 XY 图
+            # 5. 额外 Step-0 XY 图
             self.show_step0_calibrated_xy_from_algo(raw)
 
         except Exception as e:

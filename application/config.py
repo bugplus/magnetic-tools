@@ -23,6 +23,8 @@ POINTS_PER_GRID = 10   # 每格至少 10 点
 # config.py 追加
 STEP0_YAW_STEP_DEG = 5          # Step0 水平每 2° 一格
 STEP0_PPG          = 3          # Step0 每格 3 点
+# 自动算法切换阈值：Step-0 圆度误差 > 该值走 2D 保底
+CIRCULARITY_ERROR_THRESHOLD = 0.2   # 30%
 # ---------------- 坐标系 ----------------
 MAG_AXIS_MAP_A = [
     [0, 1, 0],

@@ -88,7 +88,7 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     """
     两幅图：
     1. Raw 3D 与 Calibrated 3D 并排
-    2. Step-0 XY Raw 与 Calibrated 并排
+    2. Step-0 XY Raw 与 Calibrated 并排（含圆心标注）
     """
     import matplotlib.pyplot as plt
     from PyQt5.QtWidgets import QDialog, QVBoxLayout
@@ -119,10 +119,8 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     ax1.legend()
     ax1.set_box_aspect([1, 1, 1])
 
-    # --------- Calibrated 3D（真正缩放到半径 1） ----------
+    # Calibrated 3D
     ax2 = fig3d.add_subplot(122, projection='3d')
-
-    # 1. 以原点为中心、半径 1 的单位球
     u = np.linspace(0, 2 * np.pi, 60)
     v = np.linspace(0, np.pi, 30)
     x = np.outer(np.cos(u), np.sin(v))
@@ -131,14 +129,11 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     ls = LightSource(azdeg=45, altdeg=45)
     rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
     ax2.plot_surface(x, y, z, facecolors=rgb, alpha=0.3, shade=True, antialiased=True)
-
-    # 2. 把校准后的数据真正缩放到单位球
     radii = np.linalg.norm(xyz_cal, axis=1, keepdims=True)
     radii[radii == 0] = 1
-    xyz_unit = xyz_cal / radii          # ← 关键：归一化到半径 1
+    xyz_unit = xyz_cal / radii
     for s in (0, 1, 2):
         ax2.scatter(*xyz_unit[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
-
     ax2.set_title('Calibrated on Unit Sphere (radius=1)')
     ax2.legend()
     ax2.set_box_aspect([1, 1, 1])
@@ -150,36 +145,41 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     dlg3d.exec_()
 
     # --------------------------------------------------
-    # 图2：Step-0 XY 对比
+    # 图2：Step-0 XY 对比（含圆心标注）
     # --------------------------------------------------
     mask0 = step_id == 0
     xy_raw0 = xyz_raw[mask0, :2]
     xy_cal0 = xyz_cal[mask0, :2]
-    yaw0 = yaw_raw[mask0]          # 取 yaw 角
-    yaw0 = np.where(yaw0 < 0, yaw0 + 360, yaw0)  # 归一化到 0-360
+    yaw0 = yaw_raw[mask0]
+    yaw0 = np.where(yaw0 < 0, yaw0 + 360, yaw0)
 
-    # 四色函数
     def color90(y):
         y = y % 360
         if 0 <= y < 90:   return 'red'
         if 90 <= y < 180: return 'lime'
         if 180 <= y < 270:return 'blue'
         return 'magenta'
+    c90 = [color90(y) for y in yaw0]
 
-    c90 = [color90(y) for y in yaw0]  # 每个点对应颜色
-
-    # 画图
     fig_xy = plt.figure(figsize=(12, 6))
+    # 左：Raw
     ax_raw = fig_xy.add_subplot(121, aspect='equal')
     ax_raw.scatter(*xy_raw0.T, s=8, c=c90, alpha=0.8, label='Raw')
     ax_raw.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+    cx_raw, cy_raw = xy_raw0.mean(axis=0)   # 圆心
+    ax_raw.plot(cx_raw, cy_raw, 'r+', ms=10)
+    ax_raw.text(cx_raw, cy_raw, f'({cx_raw:.2f}, {cy_raw:.2f})', color='r', fontsize=9)
     ax_raw.set_title('Step-0 XY Raw (90° colors)')
     ax_raw.legend()
     ax_raw.grid(alpha=0.3)
 
+    # 右：Calibrated
     ax_cal = fig_xy.add_subplot(122, aspect='equal')
     ax_cal.scatter(*xy_cal0.T, s=8, c=c90, alpha=0.8, label='Calibrated')
     ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+    cx_cal, cy_cal = xy_cal0.mean(axis=0)   # 圆心
+    ax_cal.plot(cx_cal, cy_cal, 'g+', ms=10)
+    ax_cal.text(cx_cal, cy_cal, f'({cx_cal:.2f}, {cy_cal:.2f})', color='g', fontsize=9)
     ax_cal.set_title('Step-0 XY Calibrated (90° colors)')
     ax_cal.legend()
     ax_cal.grid(alpha=0.3)
@@ -398,27 +398,23 @@ class CalibrationApp(QObject):
 
     # ================= 静态工具函数 =================
     @staticmethod
-    def rotate_to_level(mx, my, mz, pitch, roll):
-        """把磁矢量旋转回水平面，返回 (mx_level, my_level)"""
-        pitch = np.radians(pitch)
-        roll  = np.radians(roll)
+    def project_to_horizontal(mx, my, mz, pitch, roll):
+        """
+        用地磁+姿态角把向量投影到水平面，返回 (mx_h, my_h)
+        不用假设水平旋转，只要 pitch/roll 准，XY 就是圆
+        """
+        p = np.radians(pitch)
+        r = np.radians(roll)
 
-        cx, sx = np.cos(pitch), np.sin(pitch)
-        cy, sy = np.cos(roll),  np.sin(roll)
+        cos_p = np.cos(p)
+        sin_p = np.sin(p)
+        cos_r = np.cos(r)
+        sin_r = np.sin(r)
 
-        R_x = np.array([[1,  0,   0],
-                        [0, cx,  sx],
-                        [0,-sx,  cx]])
-
-        R_y = np.array([[ cy, 0, -sy],
-                        [  0, 1,   0],
-                        [ sy, 0,  cy]])
-
-        R = R_y @ R_x
-        m_body = np.array([mx, my, mz])
-        m_level = R @ m_body
-        return float(m_level[0]), float(m_level[1])
-
+        # 水平面投影
+        mx_h = mx * cos_r + mz * sin_r
+        my_h = mx * sin_p * sin_r + my * cos_p - mz * sin_p * cos_r
+        return float(mx_h), float(my_h)
     @staticmethod
     def fit_circle_2d(points_xy):
         """最小二乘拟合二维圆，返回 (cx, cy) 和 radius"""
@@ -778,21 +774,21 @@ class CalibrationApp(QObject):
             step_id = raw[:, 7].astype(int)
             yaw_all = raw[:, 5]
 
-            # ---- 1. 计算圆度误差 ----
+            # 1. 计算圆度误差
             circ_err = self._calc_step0_circularity_error(raw)
+            print(f"[DEBUG] circ_err = {circ_err:.6f}")  # ← 加这一行
 
-            # ---- 2. 按阈值分叉 ----
+            # 2. 按阈值分叉
             if circ_err > CIRCULARITY_ERROR_THRESHOLD:
-                # 干扰小：3D 椭球拟合（原版）
+                # 干扰小：3D 椭球 + 标准双图（已带圆心）
                 bias, A, pts_cal = run_sphere_calibration_algorithm(xyz_all, step_id)
-                plot_standard_calibration_result(
-                    xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
+                plot_standard_calibration_result(xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
             else:
-                # 干扰大：2D 强制正圆（圆心 0,0 半径 1，Z 保持）
+                # 干扰大：2D 强制正圆 + 双图（90°四色 + 圆心标注）
                 bias, A, pts_cal = self._force_2d_circle_calibration(raw)
-                self._plot_step0_forced_circle(raw, pts_cal)
+                self._plot_step0_fallback_result(raw, pts_cal)
 
-            # ---- 3. 公共：生成 C 代码 ----
+            # 3. 公共：生成 C 代码
             c_code = generate_c_code_3d(bias, A)
             c_path = os.path.join(CALIB_DIR, "mag_calib_3d.c")
             with open(c_path, 'w', encoding='utf-8') as f:
@@ -802,6 +798,7 @@ class CalibrationApp(QObject):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self.window, "Algo3D Error", str(e))
+            
     # ------------------------------------------------------------------
     # 新增：强制 Step0 XY 为正圆
     # ------------------------------------------------------------------
@@ -820,7 +817,7 @@ class CalibrationApp(QObject):
         roll  = raw_data[mask, 4]
 
         # 2. 旋转到水平面
-        def rotate_to_level(mx, my, mz, pitch, roll):
+        def project_to_horizontal(mx, my, mz, pitch, roll):
             pitch = np.radians(pitch)
             roll  = np.radians(roll)
             cx, sx = np.cos(pitch), np.sin(pitch)
@@ -838,7 +835,7 @@ class CalibrationApp(QObject):
             return float(m_level[0]), float(m_level[1])
 
         xy_level = np.array([
-            rotate_to_level(mx, my, mz, p, r)
+            project_to_horizontal(mx, my, mz, p, r)
             for mx, my, mz, p, r in zip(xyz[:,0], xyz[:,1], xyz[:,2], pitch, roll)
         ])
 
@@ -935,7 +932,7 @@ class CalibrationApp(QObject):
         roll  = raw[mask, 4]
 
         # 1. 旋转到水平面
-        xy_level = np.array([self.rotate_to_level(mx, my, mz, p, r)
+        xy_level = np.array([self.project_to_horizontal(mx, my, mz, p, r)
                             for mx, my, mz, p, r in zip(
                                 xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
 
@@ -966,7 +963,7 @@ class CalibrationApp(QObject):
         yaw0  = np.where(yaw0 < 0, yaw0 + 360, yaw0)
 
         # 旋转到水平面
-        xy_raw = np.array([self.rotate_to_level(mx, my, mz, p, r)
+        xy_raw = np.array([self.project_to_horizontal(mx, my, mz, p, r)
                         for mx, my, mz, p, r in zip(
                             xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
         xy_cal = pts_cal[:, :2]
@@ -1010,7 +1007,7 @@ class CalibrationApp(QObject):
         xyz = raw[mask, :3]
         pitch = raw[mask, 3]
         roll = raw[mask, 4]
-        xy = np.array([self.rotate_to_level(mx, my, mz, p, r)
+        xy = np.array([self.project_to_horizontal(mx, my, mz, p, r)
                        for mx, my, mz, p, r in zip(
                            xyz[:, 0], xyz[:, 1], xyz[:, 2], pitch, roll)])
         d = np.linalg.norm(xy, axis=1)
@@ -1024,7 +1021,7 @@ class CalibrationApp(QObject):
         roll = raw[mask, 4]
 
         # 1. 旋转到水平面
-        xy_level = np.array([self.rotate_to_level(mx, my, mz, p, r)
+        xy_level = np.array([self.project_to_horizontal(mx, my, mz, p, r)
                              for mx, my, mz, p, r in zip(
                                  xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
 
@@ -1047,36 +1044,50 @@ class CalibrationApp(QObject):
         return bias, A, pts_cal
 
     def _plot_step0_fallback_result(self, raw: np.ndarray, pts_cal: np.ndarray):
-        mask = raw[:, 7] == 0
-        xyz0 = raw[mask, :3]
-        pitch = raw[mask, 3]
-        roll = raw[mask, 4]
-        xy_raw = np.array([self.rotate_to_level(mx, my, mz, p, r)
-                           for mx, my, mz, p, r in zip(
-                               xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
+        mask0 = raw[:, 7] == 0
+        xyz0  = raw[mask0, :3]
+        pitch = raw[mask0, 3]
+        roll  = raw[mask0, 4]
+        yaw0  = raw[mask0, 5]
+        yaw0  = np.where(yaw0 < 0, yaw0 + 360, yaw0)
+
+        # ✅ 投影到水平面，不再“旋转”
+        xy_raw = np.array([self.project_to_horizontal(mx, my, mz, p, r)
+                        for mx, my, mz, p, r in zip(
+                            xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
         xy_cal = pts_cal[:, :2]
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.scatter(xy_raw[:, 0], xy_raw[:, 1], s=8, c='b', label='Raw')
-        ax.scatter(xy_cal[:, 0], xy_cal[:, 1], s=8, c='g', label='Forced Unit')
-        cx, cy, _ = np.linalg.lstsq(np.c_[2*xy_raw, np.ones(len(xy_raw))],
-                                    (xy_raw**2).sum(1), rcond=None)[0]
-        ax.plot(cx, cy, 'r+', markersize=12)
-        ax.add_patch(plt.Circle((cx, cy), 1, ls='--', ec='r', fc='none'))
-        ax.text(cx, cy, f'({cx:.3f}, {cy:.3f})', color='r', fontsize=9)
-        ax.plot(0, 0, 'g+', markersize=12)
-        ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='g', fc='none'))
-        ax.text(0, 0, '(0.000, 0.000)', color='g', fontsize=9,
-                ha='left', va='bottom')
-        ax.set_aspect('equal')
-        ax.set_title("Step-0 XY – 2D Fallback")
-        ax.legend()
-        ax.grid(alpha=0.3)
+
+        def color90(y):
+            y = y % 360
+            return ['red', 'lime', 'blue', 'magenta'][int(y // 90)]
+
+        c90 = [color90(y) for y in yaw0]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        for lb, col in [('0-90°', 'red'), ('90-180°', 'lime'),
+                        ('180-270°', 'blue'), ('270-360°', 'magenta')]:
+            m = [(lb == '0-90°'   and 0   <= y < 90)  or
+                (lb == '90-180°' and 90  <= y < 180) or
+                (lb == '180-270°'and 180 <= y < 270) or
+                (lb == '270-360°'and 270 <= y < 360) for y in yaw0]
+            ax1.scatter(xy_raw[m, 0], xy_raw[m, 1], c=col, s=8, alpha=0.8, label=lb)
+            ax2.scatter(xy_cal[m, 0], xy_cal[m, 1], c=col, s=8, alpha=0.8, marker='x', label=lb)
+
+        for ax, title in [(ax1, 'Raw'), (ax2, 'Calibrated')]:
+            ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
+            ax.plot(0, 0, 'k+', ms=8)
+            ax.set_aspect('equal')
+            ax.legend(title='Yaw range')
+            ax.grid(alpha=0.3)
+            ax.set_title(f'Step-0 XY {title} (90° colors)')
+
         dlg = QDialog(self.window)
-        dlg.setWindowTitle("Step-0 2D Fallback")
-        dlg.resize(600, 600)
-        dlg.setLayout(QVBoxLayout())
-        dlg.layout().addWidget(FigureCanvas(fig))
-        dlg.exec()
+        dlg.setWindowTitle("Step-0 XY – 90° Colors (RAW & Cal)")
+        dlg.resize(1200, 600)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(FigureCanvas(fig))
+        dlg.setLayout(lay)
+        dlg.exec_()
 
 if __name__ == "__main__":
     app = CalibrationApp()

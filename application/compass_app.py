@@ -95,7 +95,9 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.colors import LightSource
 
-    colors = ['#FF0000', '#00E5FF', '#8000FF']
+    colors = ['#FF3333',   # Step-0 鲜红
+          '#33AA33',   # Step-1 翠绿
+          '#3366FF']   # Step-2 亮蓝
 
     # --------------------------------------------------
     # 图1：3D 对比
@@ -647,7 +649,7 @@ class CalibrationApp(QObject):
         return b
     
     def finish_steps(self):
-        """仅采集数据并画标准图，算法由 Algo3D 固化"""
+        """三步数据采集完 → 自动3D椭球校准 → 画图+生成C代码"""
         if self.check_timer is not None:
             self.check_timer.stop()
         if hasattr(self, 'thread') and self.thread:
@@ -658,15 +660,27 @@ class CalibrationApp(QObject):
         step_id = raw[:, -1].astype(int)
         yaw_all = raw[:, 5]
 
-        # 保存原始数据
         os.makedirs(CALIB_DIR, exist_ok=True)
         np.savetxt(os.path.join(CALIB_DIR, "raw_mag_with_orientation.csv"),
                    raw, delimiter=',', fmt='%.6f')
 
-        # 仅画图，不跑算法
-        plot_standard_calibration_result(
-            xyz_all, xyz_all, step_id, yaw_all, parent=self.window)
-        self.window.set_status("Step data collected. Check the plot!")
+        # 1. 真正做 3D 椭球校准
+        bias, A, pts_cal = run_sphere_calibration_algorithm(xyz_all, step_id)
+
+        # 2. 保存校准参数供后续查看
+        self.freeze_b = bias
+        self.freeze_A = A
+
+        # 3. 画校准前后对比图
+        plot_standard_calibration_result(xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
+
+        # 4. 生成 C 代码
+        c_code = generate_c_code_3d(bias, A)
+        c_path = os.path.join(CALIB_DIR, "mag_calib_3d.c")
+        with open(c_path, 'w', encoding='utf-8') as f:
+            f.write(c_code)
+
+        self.window.set_status("3D 椭球校准完成，代码已保存至 mag_calib_3d.c")
     def view_result_3d(self):
         """
         一次性弹出三幅图：
@@ -923,36 +937,42 @@ class CalibrationApp(QObject):
         self.window.show()
         sys.exit(self.app.exec_())
 
-
     def _force_2d_circle_calibration(self, raw: np.ndarray):
-        """干扰大：仅用 Step-0 数据 → 旋转水平 → 强制正圆（0,0,1）→ Z 保持原样"""
+        """椭圆→正圆→圆心(0,0)→半径1→Z不动"""
         mask = raw[:, 7] == 0
         xyz0  = raw[mask, :3]
         pitch = raw[mask, 3]
         roll  = raw[mask, 4]
 
-        # 1. 旋转到水平面
-        xy_level = np.array([self.project_to_horizontal(mx, my, mz, p, r)
-                            for mx, my, mz, p, r in zip(
-                                xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
+        # 1. 投影到水平面
+        xy = np.array([self.project_to_horizontal(mx, my, mz, p, r)
+                    for mx, my, mz, p, r in zip(
+                        xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
 
-        # 2. 强制圆心 (0,0)
-        x, y = xy_level[:, 0], xy_level[:, 1]
-        A_mat = np.c_[2*x, 2*y, np.ones_like(x)]
-        b_vec = x**2 + y**2
-        cx, cy, _ = np.linalg.lstsq(A_mat, b_vec, rcond=None)[0]
-        xy_centered = xy_level - [cx, cy]
+        # 2. 椭圆→正圆：去相关+等比例
+        cov = np.cov(xy.T)
+        eigval, eigvec = np.linalg.eigh(cov)
+        eigval = np.maximum(eigval, 1e-6)
+        xy_rot = xy @ eigvec
+        r_mean = np.sqrt(eigval.mean())
+        if r_mean == 0:
+            r_mean = 1.0
+        xy_circ = xy_rot / r_mean @ eigvec.T
 
-        # 3. 强制半径 1
-        r_mean = np.linalg.norm(xy_centered, axis=1).mean()
-        xy_unit = xy_centered / r_mean
+        # 3. 移到 (0,0)
+        cx, cy = xy_circ.mean(axis=0)
+        xy_unit = xy_circ - [cx, cy]
 
-        # 4. 构造 3D 变换：XY 强制正圆，Z 保持原样
-        bias = np.array([cx, cy, 0.0])          # 硬铁偏移
-        A = np.diag([1.0/r_mean, 1.0/r_mean, 1.0])  # 仅 XY 缩放，Z 不缩放
-        pts_cal = (xyz0 - bias) @ A             # 先平移再缩放 → XY 正圆
+        # 4. 3D 只改 XY，Z 不动
+        bias = np.array([cx, cy, 0.0])
+        S = np.diag([1.0/r_mean, 1.0/r_mean, 1.0])
+        A_xy = eigvec @ S[:2, :2] @ eigvec.T
+        A = np.eye(3)
+        A[:2, :2] = A_xy
+        pts_cal = (xyz0 - bias) @ A
 
         return bias, A, pts_cal
+    
     def _plot_step0_forced_circle(self, raw: np.ndarray, pts_cal: np.ndarray):
         """Step-0 XY 四色 90° 分区，RAW + Cal 同一角度同色"""
         mask = raw[:, 7] == 0
@@ -1044,23 +1064,30 @@ class CalibrationApp(QObject):
         return bias, A, pts_cal
 
     def _plot_step0_fallback_result(self, raw: np.ndarray, pts_cal: np.ndarray):
+        """Step-0 XY 四色 90° 分区，RAW + Cal 同一角度同色"""
+        # 1. 先取 Step-0 子集
         mask0 = raw[:, 7] == 0
-        xyz0  = raw[mask0, :3]
-        pitch = raw[mask0, 3]
-        roll  = raw[mask0, 4]
-        yaw0  = raw[mask0, 5]
+        raw0  = raw[mask0]
+        xyz0  = raw0[:, :3]
+        pitch = raw0[:, 3]
+        roll  = raw0[:, 4]
+        yaw0  = raw0[:, 5]
         yaw0  = np.where(yaw0 < 0, yaw0 + 360, yaw0)
+        # pts0  = pts_cal[mask0]          # ← 关键：用同样 mask 取校准结果
+        pts0 = pts_cal
 
-        # ✅ 投影到水平面，不再“旋转”
+        # 2. RAW：原始投影
         xy_raw = np.array([self.project_to_horizontal(mx, my, mz, p, r)
                         for mx, my, mz, p, r in zip(
                             xyz0[:, 0], xyz0[:, 1], xyz0[:, 2], pitch, roll)])
-        xy_cal = pts_cal[:, :2]
 
+        # 3. CAL：直接拿校准后的 XY（已正圆+圆心0+半径1）
+        xy_cal = pts0[:, :2]
+
+        # 4. 四色分区
         def color90(y):
             y = y % 360
             return ['red', 'lime', 'blue', 'magenta'][int(y // 90)]
-
         c90 = [color90(y) for y in yaw0]
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))

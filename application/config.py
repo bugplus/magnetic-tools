@@ -23,8 +23,24 @@ POINTS_PER_GRID = 10   # 每格至少 10 点
 # config.py 追加
 STEP0_YAW_STEP_DEG = 5          # Step0 水平每 2° 一格
 STEP0_PPG          = 3          # Step0 每格 3 点
+
+
+# ---------------- 干扰强度指标 IMF 阈值 ----------------
+# IMF < IMF_CLEAN_TH  → 干净环境（标准3D椭球）
+# IMF ≥ IMF_CLEAN_TH  → 大干扰（终极鲁棒圆）
+IMF_CLEAN_TH = 0.05          # 干净/干扰分界
+
+# ---------------- 圆度误差阈值（旧） ----------------
+# 仅保留给旧代码兼容，可逐步废弃
+CIRCULARITY_ERROR_THRESHOLD = 0.16
 # 自动算法切换阈值：Step-0 圆度误差 > 该值走 2D 保底
 CIRCULARITY_ERROR_THRESHOLD = 0.16  # 30%
+
+# ---------------- 鲁棒圆校准一次性参数 ----------------
+ROBUST_N_SIGMA      = 2.0     # 剃飞点：> nσ 直接扔
+ROBUST_MAX_ITER     = 50      # 迭代次数，给足
+ROBUST_HARD_STRETCH = True    # True=强制标准差一致（视觉正圆）
+
 # ---------------- 坐标系 ----------------
 MAG_AXIS_MAP_A = [
     [0, 1, 0],

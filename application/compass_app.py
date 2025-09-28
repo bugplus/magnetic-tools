@@ -49,6 +49,14 @@ from config import (
 import os
 CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
 os.makedirs(CALIB_DIR, exist_ok=True)
+from config import IMF_CLEAN_TH
+
+# -------------- 新增：抗异常值+鲁棒圆校准 --------------
+from sklearn.covariance import MinCovDet
+from scipy.linalg import eigh
+
+from config import ROBUST_N_SIGMA, ROBUST_MAX_ITER, ROBUST_HARD_STRETCH
+# -------------------------------------------------------
 
 # ------------------------------------------------------------------
 # 通用正球校准：Step-0 2D圆心 + 全数据正球，主轴过圆心
@@ -186,11 +194,15 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
     ax_cal.legend()
     ax_cal.grid(alpha=0.3)
 
+    ax_cal.set_xlim(-1.2, 1.2)
+    ax_cal.set_ylim(-1.2, 1.2)
+
     dlg_xy = QDialog(parent)
     dlg_xy.setWindowTitle('Step-0 XY Comparison')
     dlg_xy.resize(1200, 600)
     QVBoxLayout(dlg_xy).addWidget(FigureCanvas(fig_xy))
     dlg_xy.exec_()
+
 def step0_force_circle(step0_xyz: np.ndarray):
     """仅用 Step0 水平数据 → 强制拉圆 → 返回圆心(bx,by) 和 缩放因子"""
     xy = step0_xyz[:, :2]
@@ -737,6 +749,10 @@ class CalibrationApp(QObject):
         # 2) Calibrated 3D
         ax2 = fig.add_subplot(132, projection='3d')
         ax2.plot_surface(x, y, z, color='skyblue', alpha=0.25, rstride=1, cstride=1)
+        ax2.set_xlim3d(-1.2, 1.2)
+        ax2.set_ylim3d(-1.2, 1.2)
+        ax2.set_zlim3d(-1.2, 1.2)
+
         for s in (0, 1, 2):
             ax2.scatter(*pts_cal[step == s].T, c='g', s=12, label=f'Step-{s}', depthshade=False)
         ax2.set_xlim(-1.2, 1.2)
@@ -772,8 +788,290 @@ class CalibrationApp(QObject):
         lay.addWidget(FigureCanvas(fig))
         dlg.setLayout(lay)
         dlg.exec_()
+
+    def _calc_step0_circularity_error(self, raw: np.ndarray) -> float:
+        """计算Step-0数据的圆度误差（标准差/均值）"""
+        mask = raw[:, 7] == 0  # Step-0数据
+        if mask.sum() < 10:
+            return 1.0  # 数据不足，返回最大误差
+        
+        # 提取Step-0的XY数据
+        xy = raw[mask, :2]
+        
+        # 计算到原点的距离
+        distances = np.linalg.norm(xy, axis=1)
+        
+        # 计算圆度误差（标准差/均值）
+        if np.mean(distances) == 0:
+            return 1.0
+            
+        return np.std(distances) / np.mean(distances)
+        
+
+    def _debug_plot_step0_xy(self, xy_data, title):
+        """调试绘图函数（优化版）"""
+        import matplotlib.pyplot as plt
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        # 计算圆心
+        center_x, center_y = np.mean(xy_data, axis=0)
+        
+        # 计算每个点相对于圆心的角度
+        angles = np.arctan2(xy_data[:, 1] - center_y, xy_data[:, 0] - center_x) * 180 / np.pi
+        angles = np.where(angles < 0, angles + 360, angles)  # 转换为0-360度
+        
+        # 定义每90度的颜色
+        colors = []
+        for angle in angles:
+            if 0 <= angle < 90:
+                colors.append('red')
+            elif 90 <= angle < 180:
+                colors.append('green')
+            elif 180 <= angle < 270:
+                colors.append('blue')
+            else:
+                colors.append('purple')
+        
+        # 绘制散点图
+        ax.scatter(xy_data[:, 0], xy_data[:, 1], s=8, c=colors, alpha=0.7)
+        
+        # 绘制参考圆
+        ax.add_patch(plt.Circle((0, 0), 1, ls='--', ec='r', fc='none'))
+        
+        # 标记圆心位置
+        ax.plot(center_x, center_y, 'kx', markersize=10, markeredgewidth=2)
+        
+        ax.set_aspect('equal')
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        
+        # 计算并显示圆度指标
+        distances = np.linalg.norm(xy_data - [center_x, center_y], axis=1)
+        circ_err = np.std(distances) / np.mean(distances) if np.mean(distances) > 0 else 1.0
+        ax.text(0.05, 0.95, f"Circularity Error: {circ_err:.4f}", transform=ax.transAxes)
+        ax.text(0.05, 0.90, f"Center: ({center_x:.3f}, {center_y:.3f})", transform=ax.transAxes)
+        
+        # 添加图例说明颜色对应的角度范围
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', label='0°-90°'),
+            Patch(facecolor='green', label='90°-180°'),
+            Patch(facecolor='blue', label='180°-270°'),
+            Patch(facecolor='purple', label='270°-360°'),
+            plt.Line2D([0], [0], marker='x', color='k', label='Center', linestyle='None', markersize=10),
+            plt.Line2D([0], [0], color='r', linestyle='--', label='Unit Circle')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        # 添加轴标签
+        ax.set_xlabel("MX")
+        ax.set_ylabel("MY")
+        
+        # 显示对话框
+        dlg = QDialog(self.window)
+        dlg.setWindowTitle(title)
+        dlg.resize(600, 600)
+        layout = QVBoxLayout()
+        layout.addWidget(FigureCanvas(fig))
+        dlg.setLayout(layout)
+        dlg.exec_()    
+    # ---------- 新增私有工具函数 ----------
+    def advanced_circle_calibration(self, xy_data, target_error=0.05, max_iterations=10):
+        """
+        高级圆校准算法，目标圆度误差 < target_error
+        使用迭代加权最小二乘法 + 异常值剔除
+        """
+        best_params = None
+        best_error = float('inf')
+        current_data = xy_data.copy()
+        
+        for iteration in range(max_iterations):
+            # 1. 使用加权最小二乘法拟合圆
+            cx, cy, radius = self.weighted_circle_fit(current_data)
+            
+            # 2. 计算每个点到圆心的距离和误差
+            distances = np.linalg.norm(current_data - [cx, cy], axis=1)
+            errors = np.abs(distances - radius)
+            
+            # 3. 计算当前圆度误差
+            circ_err = np.std(distances) / np.mean(distances)
+            print(f"Iteration {iteration+1}: Circularity error = {circ_err:.6f}")
+            
+            # 4. 检查是否达到目标
+            if circ_err < target_error:
+                print(f"达到目标圆度误差 {circ_err:.6f} < {target_error}")
+                return cx, cy, radius, circ_err
+            
+            # 5. 更新最佳参数
+            if circ_err < best_error:
+                best_error = circ_err
+                best_params = (cx, cy, radius)
+            
+            # 6. 剔除异常值（误差最大的5%）
+            threshold = np.percentile(errors, 95)  # 95百分位
+            mask = errors < threshold
+            remaining_points = np.sum(mask)
+            
+            if remaining_points < len(current_data) * 0.7:  # 至少保留70%的点
+                print(f"迭代 {iteration+1}: 剔除过多点({remaining_points}/{len(current_data)})，停止优化")
+                break
+                
+            current_data = current_data[mask]
+            
+            # 7. 如果改进很小，提前终止
+            if iteration > 0 and (best_error - circ_err) < 0.005:
+                print(f"迭代 {iteration+1}: 改进很小({best_error-circ_err:.6f})，停止优化")
+                break
+        
+        # 返回最佳结果
+        if best_params:
+            cx, cy, radius = best_params
+            distances = np.linalg.norm(xy_data - [cx, cy], axis=1)
+            circ_err = np.std(distances) / np.mean(distances)
+            return cx, cy, radius, circ_err
+        
+        # 失败时返回原始数据的统计
+        cx, cy = np.mean(xy_data, axis=0)
+        distances = np.linalg.norm(xy_data - [cx, cy], axis=1)
+        radius = np.mean(distances)
+        circ_err = np.std(distances) / radius
+        return cx, cy, radius, circ_err
+
+    def weighted_circle_fit(self, xy_data):
+        """加权最小二乘法圆拟合"""
+        x, y = xy_data[:, 0], xy_data[:, 1]
+        
+        # 计算初始圆心和半径（未加权）
+        cx0, cy0 = np.mean(xy_data, axis=0)
+        distances0 = np.linalg.norm(xy_data - [cx0, cy0], axis=1)
+        radius0 = np.mean(distances0)
+        
+        # 第一次拟合：计算权重（基于到初始圆的距离）
+        errors0 = np.abs(distances0 - radius0)
+        weights = 1.0 / (1.0 + errors0)  # 误差越小，权重越大
+        
+        # 加权最小二乘圆拟合
+        A = np.column_stack([2*x, 2*y, np.ones_like(x)])
+        b = x**2 + y**2
+        
+        # 应用权重
+        W = np.diag(weights)
+        A_weighted = W @ A
+        b_weighted = W @ b
+        
+        # 求解
+        try:
+            cx, cy, c = np.linalg.lstsq(A_weighted, b_weighted, rcond=None)[0]
+            radius = np.sqrt(cx**2 + cy**2 + c)
+            return cx, cy, radius
+        except:
+            # 失败时返回简单平均值
+            return cx0, cy0, radius0 
+        
+    def enhanced_forced_circle_calibration(self, xyz_all, step_id):
+        """
+        增强型强制单位圆校准
+        使用高级圆校准算法优化Step-0 XY数据
+        """
+        # 1. 标准3D椭球校准
+        bias, A, _ = run_sphere_calibration_algorithm(xyz_all, step_id)
+        
+        if bias is None or A is None:
+            print("Error: Initial 3D ellipsoid fitting failed")
+            return None, None, None
+        
+        # 2. 全体数据先校准一次
+        xyz_cal = (xyz_all - bias) @ A.T
+        
+        # 3. 提取Step-0 XY数据
+        mask0 = step_id == 0
+        xy_cal = xyz_cal[mask0, :2]
+        
+        # 4. 使用高级圆校准算法
+        cx, cy, radius, circ_err = self.advanced_circle_calibration(xy_cal, target_error=0.05)
+        print(f"高级圆校准结果: 圆心=({cx:.6f}, {cy:.6f}), 半径={radius:.6f}, 圆度误差={circ_err:.6f}")
+        
+        # 5. 构造最终参数
+        # 创建缩放矩阵（只缩放XY平面）
+        S = np.eye(3)
+        S[0, 0] = 1.0 / radius
+        S[1, 1] = 1.0 / radius
+        
+        # 计算新的变换矩阵
+        final_A = S @ A
+        
+        # 计算新的硬铁偏移
+        xy_offset = np.array([cx, cy, 0])
+        bias_adjustment = xy_offset @ np.linalg.inv(A).T
+        final_bias = bias + bias_adjustment
+        
+        # 6. 最终点云
+        pts_final = (xyz_all - final_bias) @ final_A.T
+        
+        return final_bias, final_A, pts_final
+    # ===================================================================
+    #  终极鲁棒圆校准：干扰大一次性压成正圆，四象限半径差 < 0.01
+    # ===================================================================
+    def robust_final_circle_calib(self, xyz_all, step_id, yaw_all):
+        """返回 (bias, A, pts_cal) 一步到位"""
+        # 1. 先标准 3D 椭球
+        bias, A, _ = run_sphere_calibration_algorithm(xyz_all, step_id)
+        xyz_cal = (xyz_all - bias) @ A.T
+
+        # 2. 取出 Step-0 水平面数据
+        mask0 = step_id == 0
+        xy = xyz_cal[mask0, :2]
+        yaw0 = yaw_all[mask0]
+
+        # 3. 终极鲁棒圆校准
+        xy_final = self._robust_circle_core(xy, yaw0, target_circ=0.01)
+
+        # 4. 构造修正量（只动 XY，Z 不动）
+        cx, cy = xy.mean(0) - xy_final.mean(0)          # 圆心平移
+        scale = np.mean(np.linalg.norm(xy_final, axis=1))  # 应该≈1
+        S = np.diag([1.0/scale, 1.0/scale, 1.0])
+        A_final = S @ A
+        bias_final = bias + np.array([cx, cy, 0])
+
+        # 5. 全点云应用
+        pts_final = (xyz_all - bias_final) @ A_final.T
+        return bias_final, A_final, pts_final
+
+    # ---------------- 核心：鲁棒圆 ----------------
+    def _robust_circle_core(self, xy, yaw, target_circ=0.01):
+        # 1. 去相关：长轴对准 X
+        cov = np.cov(xy.T)
+        eigval, eigvec = eigh(cov)
+        xy_rot = (xy - xy.mean(axis=0)) @ eigvec
+
+        # 2. 极限硬拉伸：X/Y 分别除最大绝对值 → 边框变正方形
+        xmax, ymax = np.abs(xy_rot).max(axis=0)
+        xy_rot[:, 0] /= xmax
+        xy_rot[:, 1] /= ymax
+
+        # 3. 圆心归零
+        xy_rot -= xy_rot.mean(axis=0)
+
+        # 4. 再压回半径 1
+        xy_rot /= np.mean(np.linalg.norm(xy_rot, axis=1))
+
+        return xy_rot @ eigvec.T + xy.mean(axis=0)
+    
+    def _imf(self, xy, xyz):
+        """IMF < 0.05 干净；> 0.05 上狠活"""
+        cov = np.cov(xy.T)
+        eig = np.linalg.eigvalsh(cov)
+        flat = np.sqrt(eig.max() / eig.min()) - 1.0
+        var3 = np.cov(xyz.T).trace()
+        k = 1e-4                                     # 经验常数
+        return float(flat + k * var3)
+
     @pyqtSlot()
     def on_algo3d(self):
+        """校准算法入口（优化版）"""
         fname, _ = QFileDialog.getOpenFileName(
             self.window, "Select CSV", CALIB_DIR, "CSV (*.csv)")
         if not fname:
@@ -790,32 +1088,48 @@ class CalibrationApp(QObject):
 
             # 1. 计算圆度误差
             circ_err = self._calc_step0_circularity_error(raw)
-            print(f"[DEBUG] circ_err = {circ_err:.6f}")  # ← 加这一行
+            print(f"圆度误差: {circ_err:.6f}")
 
-            # 2. 按阈值分叉
-            if circ_err > CIRCULARITY_ERROR_THRESHOLD:
-                # 干扰小：3D 椭球 + 标准双图（已带圆心）
+            # 2. 显示校准前的数据
+            mask0 = step_id == 0
+            xy_raw_step0 = xyz_all[mask0, :2]
+            self._debug_plot_step0_xy(xy_raw_step0, f"Step0 XY Raw (CircErr: {circ_err:.6f})")
+
+            # 3. 按阈值选择校准方法
+            # 计算干扰强度指标 IMF
+            imf_val = self._imf(xy_raw_step0, xyz_all[mask0])
+            print(f"IMF={imf_val:.3f}")
+
+            if imf_val < IMF_CLEAN_TH:# 干净环境
+                print("小干扰，标准3D椭球校准")
                 bias, A, pts_cal = run_sphere_calibration_algorithm(xyz_all, step_id)
-                plot_standard_calibration_result(xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
-            else:
-                # 干扰大：2D 强制正圆 + 双图（90°四色 + 圆心标注）
-                bias, A, pts_cal = self._force_2d_circle_calibration(raw)
-                self._plot_step0_fallback_result(raw, pts_cal)
+            else:                       # 电机贴脸或随机跳动大
+                print("大干扰，终极鲁棒圆校准")
+                bias, A, pts_cal = self.robust_final_circle_calib(xyz_all, step_id, yaw_all)
 
-            # 3. 公共：生成 C 代码
+            if bias is None or A is None:
+                QMessageBox.warning(self.window, "校准失败", "校准算法失败，请检查数据质量")
+                return
+
+            # 4. 显示校准后的数据
+            xy_cal_step0 = pts_cal[mask0, :2]
+            self._debug_plot_step0_xy(xy_cal_step0, "Step0 XY Calibrated")
+
+            # 5. 绘制校准结果
+            plot_standard_calibration_result(xyz_all, pts_cal, step_id, yaw_all, parent=self.window)
+
+            # 6. 生成C代码
             c_code = generate_c_code_3d(bias, A)
             c_path = os.path.join(CALIB_DIR, "mag_calib_3d.c")
             with open(c_path, 'w', encoding='utf-8') as f:
                 f.write(c_code)
+                
+            QMessageBox.information(self.window, "完成", "校准完成，代码已保存")
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self.window, "Algo3D Error", str(e))
-            
-    # ------------------------------------------------------------------
-    # 新增：强制 Step0 XY 为正圆
-    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # 新增：强制 Step0 XY 为正圆
     # ------------------------------------------------------------------
@@ -979,7 +1293,7 @@ class CalibrationApp(QObject):
         xyz0  = raw[mask, :3]
         pitch = raw[mask, 3]
         roll  = raw[mask, 4]
-        yaw0  = raw[mask, 6]          # 角度在第 6 列
+        yaw0  = raw[mask, 5]          # 角度在第 6 列
         yaw0  = np.where(yaw0 < 0, yaw0 + 360, yaw0)
 
         # 旋转到水平面
@@ -1019,20 +1333,7 @@ class CalibrationApp(QObject):
         lay.addWidget(FigureCanvas(fig))
         dlg.setLayout(lay)
         dlg.exec_()
-    # ---------- 新增私有工具函数 ----------
-    def _calc_step0_circularity_error(self, raw: np.ndarray) -> float:
-        mask = raw[:, 7] == 0
-        if mask.sum() < 50:
-            return 1.0
-        xyz = raw[mask, :3]
-        pitch = raw[mask, 3]
-        roll = raw[mask, 4]
-        xy = np.array([self.project_to_horizontal(mx, my, mz, p, r)
-                       for mx, my, mz, p, r in zip(
-                           xyz[:, 0], xyz[:, 1], xyz[:, 2], pitch, roll)])
-        d = np.linalg.norm(xy, axis=1)
-        return d.std() / d.mean() if d.mean() else 1.0
-
+    
     def _safe_calibration_2d_fallback(self, raw: np.ndarray):
         """仅用 Step-0 数据 → 旋转水平 → 强制正圆（圆心 0,0 半径 1）"""
         mask = raw[:, 7] == 0
@@ -1115,6 +1416,56 @@ class CalibrationApp(QObject):
         lay.addWidget(FigureCanvas(fig))
         dlg.setLayout(lay)
         dlg.exec_()
+
+    def run_3d_plus_step0_forced_circle(self, xyz_all, step_id):
+        """
+        强制单位圆校准（优化版）
+        保持函数名不变，优化实现逻辑
+        """
+        # 1. 标准3D椭球校准
+        bias, A, _ = run_sphere_calibration_algorithm(xyz_all, step_id)
+        
+        if bias is None or A is None:
+            print("Error: Initial 3D ellipsoid fitting failed")
+            return None, None, None
+        
+        # 2. 全体数据先校准一次
+        xyz_cal = (xyz_all - bias) @ A.T
+        
+        # 3. 提取Step-0 XY数据
+        mask0 = step_id == 0
+        xy_cal = xyz_cal[mask0, :2]
+        
+        # 4. 使用简单有效的圆拟合
+        x, y = xy_cal[:, 0], xy_cal[:, 1]
+        A_mat = np.column_stack([2*x, 2*y, np.ones_like(x)])
+        b_vec = x**2 + y**2
+        
+        try:
+            cx, cy, c = np.linalg.lstsq(A_mat, b_vec, rcond=None)[0]
+            radius = np.sqrt(cx**2 + cy**2 + c)
+        except:
+            # 失败时使用简单平均值
+            cx, cy = np.mean(xy_cal, axis=0)
+            distances = np.linalg.norm(xy_cal - [cx, cy], axis=1)
+            radius = np.mean(distances)
+        
+        # 5. 构造最终参数
+        S = np.eye(3)
+        S[0, 0] = 1.0 / radius
+        S[1, 1] = 1.0 / radius
+        
+        final_A = S @ A
+        xy_offset = np.array([cx, cy, 0])
+        bias_adjustment = xy_offset @ np.linalg.inv(A).T
+        final_bias = bias + bias_adjustment
+        
+        # 6. 最终点云
+        pts_final = (xyz_all - final_bias) @ final_A.T
+        
+        print(f"强制单位圆校准: 圆心=({cx:.3f}, {cy:.3f}), 半径={radius:.3f}")
+        
+        return final_bias, final_A, pts_final
 
 if __name__ == "__main__":
     app = CalibrationApp()

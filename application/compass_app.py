@@ -54,13 +54,17 @@ from config import IMF_CLEAN_TH
 from scipy.linalg import eigh
 
 from config import ROBUST_N_SIGMA, ROBUST_MAX_ITER
+import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'DejaVu Sans'  # 使用标准英文字体
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # 避免中文乱码
 # -------------------------------------------------------
 
 # ------------------------------------------------------------------
 # 通用正球校准：Step-0 2D圆心 + 全数据正球，主轴过圆心
 # ------------------------------------------------------------------
 def run_sphere_calibration_algorithm(xyz_all: np.ndarray,
-                                     step_id: np.ndarray) -> tuple:
+                                     step_id: np.ndarray, 
+                                     imf_value: float = None) -> tuple:
     from numpy.linalg import lstsq
 
     # 1. Step0 XY 圆心
@@ -80,87 +84,45 @@ def run_sphere_calibration_algorithm(xyz_all: np.ndarray,
     A = np.eye(3) / radius                 # 整体缩放到半径 1
     pts_cal = (xyz_all - bias) @ A         # 先平移再缩放
 
-    # 4. 确保 Step0 XY 圆心再平移到 0,0
-    xy_cal0 = pts_cal[mask0, :2]
-    cx_cal, cy_cal, _ = lstsq(np.c_[2*xy_cal0[:,0], 2*xy_cal0[:,1], np.ones(len(xy_cal0))],
-                              xy_cal0[:,0]**2 + xy_cal0[:,1]**2, rcond=None)[0]
-    # 二次平移仅作用于 XY
-    pts_cal[:, :2] -= [cx_cal, cy_cal]
+    # 4. 如果干扰大(IMF值高)，强制将圆心移到(0,0)
+    if imf_value is not None and imf_value > IMF_CLEAN_TH:
+        # 强制圆心为(0,0)
+        pts_cal[:, :2] -= np.mean(pts_cal[mask0, :2], axis=0)
+    else:
+        # 确保 Step0 XY 圆心再平移到 0,0
+        xy_cal0 = pts_cal[mask0, :2]
+        cx_cal, cy_cal, _ = lstsq(np.c_[2*xy_cal0[:,0], 2*xy_cal0[:,1], np.ones(len(xy_cal0))],
+                                  xy_cal0[:,0]**2 + xy_cal0[:,1]**2, rcond=None)[0]
+        # 二次平移仅作用于 XY
+        pts_cal[:, :2] -= [cx_cal, cy_cal]
 
-    # 5. 更新 bias
-    bias[:2] += np.array([cx_cal, cy_cal]) * radius  # 把二次平移映射回原坐标
+        # 5. 更新 bias
+        bias[:2] += np.array([cx_cal, cy_cal]) * radius  # 把二次平移映射回原坐标
+    
     return bias, A, pts_cal
 def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=None):
     """
     两幅图：
-    1. Raw 3D 与 Calibrated 3D 并排
-    2. Step-0 XY Raw 与 Calibrated 并排（含圆心标注）
+    1. Raw 3D vs Calibrated 3D side by side
+    2. Step-0 XY Raw vs Calibrated side by side (with center annotations)
     """
     import matplotlib.pyplot as plt
     from PyQt5.QtWidgets import QDialog, QVBoxLayout
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.colors import LightSource
 
-    colors = ['#FF3333',   # Step-0 鲜红
-          '#33AA33',   # Step-1 翠绿
-          '#3366FF']   # Step-2 亮蓝
-
-    # --------------------------------------------------
-    # 图1：3D 对比
-    # --------------------------------------------------
-    fig3d = plt.figure(figsize=(16, 8))
-
-    # Raw 3D
-    ax1 = fig3d.add_subplot(121, projection='3d')
-    cx_raw, cy_raw, cz_raw = xyz_raw.mean(axis=0)
-    u = np.linspace(0, 2 * np.pi, 60)
-    v = np.linspace(0, np.pi, 30)
-    x = cx_raw + np.outer(np.cos(u), np.sin(v))
-    y = cy_raw + np.outer(np.sin(u), np.sin(v))
-    z = cz_raw + np.outer(np.ones_like(u), np.cos(v))
-    ls = LightSource(azdeg=45, altdeg=45)
-    rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
-    ax1.plot_surface(x, y, z, facecolors=rgb, alpha=0.4, shade=True, antialiased=True)
-    for s in (0, 1, 2):
-        ax1.scatter(*xyz_raw[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
-    ax1.set_title('Raw 3D Mag')
-    ax1.legend()
-    ax1.set_box_aspect([1, 1, 1])
-
-    # Calibrated 3D
-    ax2 = fig3d.add_subplot(122, projection='3d')
-    u = np.linspace(0, 2 * np.pi, 60)
-    v = np.linspace(0, np.pi, 30)
-    x = np.outer(np.cos(u), np.sin(v))
-    y = np.outer(np.sin(u), np.sin(v))
-    z = np.outer(np.ones_like(u), np.cos(v))
-    ls = LightSource(azdeg=45, altdeg=45)
-    rgb = ls.shade(z, cmap=plt.cm.coolwarm, vert_exag=0.1, blend_mode='soft')
-    ax2.plot_surface(x, y, z, facecolors=rgb, alpha=0.3, shade=True, antialiased=True)
-    radii = np.linalg.norm(xyz_cal, axis=1, keepdims=True)
-    radii[radii == 0] = 1
-    xyz_unit = xyz_cal / radii
-    for s in (0, 1, 2):
-        ax2.scatter(*xyz_unit[step_id == s].T, c=colors[s], s=12, label=f'Step-{s}')
-    ax2.set_title('Calibrated on Unit Sphere (radius=1)')
-    ax2.legend()
-    ax2.set_box_aspect([1, 1, 1])
-
-    dlg3d = QDialog(parent)
-    dlg3d.setWindowTitle('3D Comparison')
-    dlg3d.resize(1600, 800)
-    QVBoxLayout(dlg3d).addWidget(FigureCanvas(fig3d))
-    dlg3d.exec_()
-
-    # --------------------------------------------------
-    # 图2：Step-0 XY 对比（含圆心标注）
-    # --------------------------------------------------
+    # 设置字体避免乱码
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    
+    # 提取Step-0数据
     mask0 = step_id == 0
     xy_raw0 = xyz_raw[mask0, :2]
     xy_cal0 = xyz_cal[mask0, :2]
     yaw0 = yaw_raw[mask0]
     yaw0 = np.where(yaw0 < 0, yaw0 + 360, yaw0)
 
+    # 90度分色函数
     def color90(y):
         y = y % 360
         if 0 <= y < 90:   return 'red'
@@ -169,34 +131,68 @@ def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=
         return 'magenta'
     c90 = [color90(y) for y in yaw0]
 
+    # 创建图表
     fig_xy = plt.figure(figsize=(12, 6))
-    # 左：Raw
+    
+    # Left: Raw data
     ax_raw = fig_xy.add_subplot(121, aspect='equal')
-    ax_raw.scatter(*xy_raw0.T, s=8, c=c90, alpha=0.8, label='Raw')
-    ax_raw.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
-    cx_raw, cy_raw = xy_raw0.mean(axis=0)   # 圆心
-    ax_raw.plot(cx_raw, cy_raw, 'r+', ms=10)
-    ax_raw.text(cx_raw, cy_raw, f'({cx_raw:.2f}, {cy_raw:.2f})', color='r', fontsize=9)
-    ax_raw.set_title('Step-0 XY Raw (90° colors)')
-    ax_raw.legend()
+    ax_raw.scatter(*xy_raw0.T, s=8, c=c90, alpha=0.8, label='Data Points')
+    ax_raw.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none', label='Unit Circle'))
+    
+    # 计算圆心位置
+    cx_raw, cy_raw = np.mean(xy_raw0, axis=0)
+    
+    # 标注单位圆圆心(0,0) - 使用十字标记
+    ax_raw.plot(0, 0, 'k+', ms=12, mew=2, zorder=10, label='Unit Center (0,0)')
+    
+    # 标注数据圆心 - 使用X标记，确保在顶层显示
+    ax_raw.plot(cx_raw, cy_raw, 'rx', ms=10, mew=2, zorder=10, label='Data Center')
+    
+    # 信息框放在左上角，避免遮挡数据
+    info_text = f"Unit Center: (0.000, 0.000)\nData Center: ({cx_raw:.3f}, {cy_raw:.3f})"
+    ax_raw.text(0.02, 0.98, info_text, transform=ax_raw.transAxes, 
+                verticalalignment='top', horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                fontsize=10, zorder=10)
+    
+    ax_raw.set_title('Step-0 XY Raw Data (90° Color Coding)')
+    ax_raw.set_xlabel('Magnetometer X')
+    ax_raw.set_ylabel('Magnetometer Y')
+    ax_raw.legend(loc='lower right')  # 图例放在右下角，避免遮挡
     ax_raw.grid(alpha=0.3)
 
-    # 右：Calibrated
+    # Right: Calibrated data
     ax_cal = fig_xy.add_subplot(122, aspect='equal')
-    ax_cal.scatter(*xy_cal0.T, s=8, c=c90, alpha=0.8, label='Calibrated')
-    ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none'))
-    cx_cal, cy_cal = xy_cal0.mean(axis=0)   # 圆心
-    ax_cal.plot(cx_cal, cy_cal, 'g+', ms=10)
-    ax_cal.text(cx_cal, cy_cal, f'({cx_cal:.2f}, {cy_cal:.2f})', color='g', fontsize=9)
-    ax_cal.set_title('Step-0 XY Calibrated (90° colors)')
-    ax_cal.legend()
+    ax_cal.scatter(*xy_cal0.T, s=8, c=c90, alpha=0.8, label='Data Points')
+    ax_cal.add_patch(plt.Circle((0, 0), 1, ls='--', ec='k', fc='none', label='Unit Circle'))
+    
+    # 计算圆心位置
+    cx_cal, cy_cal = np.mean(xy_cal0, axis=0)
+    
+    # 标注单位圆圆心(0,0) - 使用十字标记
+    ax_cal.plot(0, 0, 'k+', ms=12, mew=2, zorder=10, label='Unit Center (0,0)')
+    
+    # 标注数据圆心 - 使用X标记，确保在顶层显示
+    ax_cal.plot(cx_cal, cy_cal, 'gx', ms=10, mew=2, zorder=10, label='Data Center')
+    
+    # 信息框放在左上角，避免遮挡数据
+    info_text = f"Unit Center: (0.000, 0.000)\nData Center: ({cx_cal:.3f}, {cy_cal:.3f})"
+    ax_cal.text(0.02, 0.98, info_text, transform=ax_cal.transAxes, 
+                verticalalignment='top', horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                fontsize=10, zorder=10)
+    
+    ax_cal.set_title('Step-0 XY Calibrated Data (90° Color Coding)')
+    ax_cal.set_xlabel('Calibrated X')
+    ax_cal.set_ylabel('Calibrated Y')
+    ax_cal.legend(loc='lower right')  # 图例放在右下角，避免遮挡
     ax_cal.grid(alpha=0.3)
-
     ax_cal.set_xlim(-1.2, 1.2)
     ax_cal.set_ylim(-1.2, 1.2)
 
+    # 设置对话框标题为英文
     dlg_xy = QDialog(parent)
-    dlg_xy.setWindowTitle('Step-0 XY Comparison')
+    dlg_xy.setWindowTitle('Step-0 XY Data Comparison')
     dlg_xy.resize(1200, 600)
     QVBoxLayout(dlg_xy).addWidget(FigureCanvas(fig_xy))
     dlg_xy.exec_()

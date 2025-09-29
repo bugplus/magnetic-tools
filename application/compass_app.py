@@ -1073,6 +1073,118 @@ class CalibrationApp(QObject):
 
         return xy_rot @ eigvec.T + xy.mean(axis=0)
     
+    def robust_final_circle_calib_enhanced(self, xyz_all, step_id, yaw_all):
+        """
+        强化版终极鲁棒圆校准 - 专注于强制椭圆转正圆
+        确保不会返回空数据
+        """
+        # 1. 取出 Step-0 数据
+        mask0 = step_id == 0
+        xy_raw = xyz_all[mask0, :2]  # 只取XY
+        
+        # 2. 计算原始数据的椭圆参数
+        # 计算中心
+        center_x, center_y = np.mean(xy_raw, axis=0)
+        
+        # 中心化数据
+        xy_centered = xy_raw - [center_x, center_y]
+        
+        # 计算协方差矩阵
+        cov = np.cov(xy_centered.T)
+        
+        # 计算特征值和特征向量
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        
+        # 计算椭圆的长短轴
+        a = np.sqrt(eigvals[1])  # 长轴
+        b = np.sqrt(eigvals[0])  # 短轴
+        
+        # 计算旋转角度
+        angle = np.arctan2(eigvecs[1, 1], eigvecs[0, 1])
+        
+        # 3. 构造变换矩阵，将椭圆转换为正圆
+        # 旋转矩阵（将椭圆旋转到与坐标轴对齐）
+        R = np.array([[np.cos(-angle), -np.sin(-angle)],
+                    [np.sin(-angle), np.cos(-angle)]])
+        
+        # 缩放矩阵（将长短轴缩放为相同长度）
+        S = np.array([[1.0/a, 0.0],
+                    [0.0, 1.0/b]])
+        
+        # 组合变换：先旋转，再缩放，再旋转回去
+        T = R.T @ S @ R
+        
+        # 4. 应用变换到原始数据
+        xy_transformed = xy_centered @ T
+        
+        # 5. 计算最终缩放因子，确保半径为1
+        radii = np.linalg.norm(xy_transformed, axis=1)
+        mean_radius = np.mean(radii)
+        if mean_radius > 0:
+            final_scale = 1.0 / mean_radius
+        else:
+            final_scale = 1.0
+        
+        # 6. 构造3D变换矩阵和偏移向量
+        A_3d = np.eye(3)
+        A_3d[0:2, 0:2] = T * final_scale  # 应用XY平面的变换
+        
+        bias = np.zeros(3)
+        bias[0] = center_x
+        bias[1] = center_y
+        
+        # 7. 应用变换到所有点
+        pts_cal = (xyz_all - bias) @ A_3d.T
+        
+        return bias, A_3d, pts_cal
+
+    def _hyper_robust_circle_enforcement(self, xy_data, yaw_data):
+        """
+        超强制的正圆变换 - 专注于强制椭圆转正圆
+        不考虑数据质量，只关注将椭圆转换为正圆
+        """
+        # 1. 计算椭圆的主轴和旋转角度
+        if len(xy_data) < 2:
+            return xy_data
+            
+        # 计算协方差矩阵
+        cov = np.cov(xy_data.T)
+        
+        # 计算特征值和特征向量
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        
+        # 计算椭圆的长短轴
+        a = np.sqrt(eigvals[1])  # 长轴
+        b = np.sqrt(eigvals[0])  # 短轴
+        
+        # 计算旋转角度
+        angle = np.arctan2(eigvecs[1, 1], eigvecs[0, 1])
+        
+        # 2. 构造逆变换矩阵，将椭圆转换为正圆
+        # 先旋转回正，然后缩放，再旋转回去
+        R = np.array([[np.cos(angle), -np.sin(angle)],
+                    [np.sin(angle), np.cos(angle)]])
+        
+        S = np.array([[1.0/a, 0.0],
+                    [0.0, 1.0/b]])
+        
+        # 逆变换矩阵
+        T = R @ S @ R.T
+        
+        # 3. 应用变换
+        center = np.mean(xy_data, axis=0)
+        centered = xy_data - center
+        transformed = centered @ T
+        
+        # 4. 确保半径为1
+        radii = np.linalg.norm(transformed, axis=1)
+        mean_radius = np.mean(radii)
+        if mean_radius > 0:
+            transformed /= mean_radius
+        
+        # 5. 返回变换后的数据（保持中心不变）
+        return transformed + center
+    
     def _imf(self, xy, xyz):
         """IMF < 0.05 干净；> 0.05 上狠活"""
         cov = np.cov(xy.T)
@@ -1116,9 +1228,17 @@ class CalibrationApp(QObject):
             if imf_val < IMF_CLEAN_TH:# 干净环境
                 print("小干扰，标准3D椭球校准")
                 bias, A, pts_cal = run_sphere_calibration_algorithm(xyz_all, step_id)
-            else:                       # 电机贴脸或随机跳动大
+            else:
                 print("大干扰，终极鲁棒圆校准")
-                bias, A, pts_cal = self.robust_final_circle_calib(xyz_all, step_id, yaw_all)
+                bias, A, pts_cal = self.robust_final_circle_calib_enhanced(xyz_all, step_id, yaw_all)
+                
+                # 添加调试输出
+                print(f"校准结果: bias={bias}, A={A}")
+                print(f"校准后数据形状: {pts_cal.shape if pts_cal is not None else 'None'}")
+                if pts_cal is not None and len(pts_cal) > 0:
+                    print(f"校准后数据范围: X[{pts_cal[:,0].min():.3f}, {pts_cal[:,0].max():.3f}], "
+                        f"Y[{pts_cal[:,1].min():.3f}, {pts_cal[:,1].max():.3f}], "
+                        f"Z[{pts_cal[:,2].min():.3f}, {pts_cal[:,2].max():.3f}]")
 
             if bias is None or A is None:
                 QMessageBox.warning(self.window, "校准失败", "校准算法失败，请检查数据质量")

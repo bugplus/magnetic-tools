@@ -51,11 +51,9 @@ CALIB_DIR = os.path.join(os.path.dirname(__file__), "calibration_mag")
 os.makedirs(CALIB_DIR, exist_ok=True)
 from config import IMF_CLEAN_TH
 
-# -------------- 新增：抗异常值+鲁棒圆校准 --------------
-from sklearn.covariance import MinCovDet
 from scipy.linalg import eigh
 
-from config import ROBUST_N_SIGMA, ROBUST_MAX_ITER, ROBUST_HARD_STRETCH
+from config import ROBUST_N_SIGMA, ROBUST_MAX_ITER
 # -------------------------------------------------------
 
 # ------------------------------------------------------------------
@@ -1042,20 +1040,35 @@ class CalibrationApp(QObject):
 
     # ---------------- 核心：鲁棒圆 ----------------
     def _robust_circle_core(self, xy, yaw, target_circ=0.01):
-        # 1. 去相关：长轴对准 X
+        """
+        硬拉正圆：标准差→1 + 飞点剃掉 + 半径→1
+        """
+
+        # 0. 剃飞点（先干净）
+        d0 = np.linalg.norm(xy, axis=1)
+        mask = d0 < d0.mean() + ROBUST_N_SIGMA * d0.std()
+        xy, yaw = xy[mask], yaw[mask]
+
+        # 1. 去相关旋转
         cov = np.cov(xy.T)
         eigval, eigvec = eigh(cov)
         xy_rot = (xy - xy.mean(axis=0)) @ eigvec
 
-        # 2. 极限硬拉伸：X/Y 分别除最大绝对值 → 边框变正方形
-        xmax, ymax = np.abs(xy_rot).max(axis=0)
-        xy_rot[:, 0] /= xmax
-        xy_rot[:, 1] /= ymax
+        # 2. 长短轴分别压到 1（硬尺子）
+        long, short = np.sqrt(eigval)
+        xy_rot[:, 0] /= long
+        xy_rot[:, 1] /= short
 
         # 3. 圆心归零
         xy_rot -= xy_rot.mean(axis=0)
 
-        # 4. 再压回半径 1
+        # 4. 标准差再压 1（视觉正圆）
+        std_x, std_y = np.std(xy_rot, axis=0)
+        if std_x > 0 and std_y > 0:
+            xy_rot[:, 0] /= std_x
+            xy_rot[:, 1] /= std_y
+
+        # 5. 最终半径 = 1
         xy_rot /= np.mean(np.linalg.norm(xy_rot, axis=1))
 
         return xy_rot @ eigvec.T + xy.mean(axis=0)

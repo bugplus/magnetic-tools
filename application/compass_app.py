@@ -84,22 +84,21 @@ def run_sphere_calibration_algorithm(xyz_all: np.ndarray,
     A = np.eye(3) / radius                 # 整体缩放到半径 1
     pts_cal = (xyz_all - bias) @ A         # 先平移再缩放
 
-    # 4. 如果干扰大(IMF值高)，强制将圆心移到(0,0)
-    if imf_value is not None and imf_value > IMF_CLEAN_TH:
-        # 强制圆心为(0,0)
-        pts_cal[:, :2] -= np.mean(pts_cal[mask0, :2], axis=0)
-    else:
-        # 确保 Step0 XY 圆心再平移到 0,0
-        xy_cal0 = pts_cal[mask0, :2]
-        cx_cal, cy_cal, _ = lstsq(np.c_[2*xy_cal0[:,0], 2*xy_cal0[:,1], np.ones(len(xy_cal0))],
-                                  xy_cal0[:,0]**2 + xy_cal0[:,1]**2, rcond=None)[0]
-        # 二次平移仅作用于 XY
-        pts_cal[:, :2] -= [cx_cal, cy_cal]
-
-        # 5. 更新 bias
-        bias[:2] += np.array([cx_cal, cy_cal]) * radius  # 把二次平移映射回原坐标
+    # 4. 无论干扰大小，都强制圆心为(0,0)
+    # 提取 Step0 XY 数据
+    xy_cal0 = pts_cal[mask0, :2]
+    
+    # 计算圆心偏移量
+    cx_cal, cy_cal = np.mean(xy_cal0, axis=0)
+    
+    # 强制平移圆心到(0,0)
+    pts_cal[:, :2] -= [cx_cal, cy_cal]
+    
+    # 更新 bias，反映这次平移
+    bias[:2] += np.array([cx_cal, cy_cal]) * radius
     
     return bias, A, pts_cal
+
 def plot_standard_calibration_result(xyz_raw, xyz_cal, step_id, yaw_raw, parent=None):
     """
     两幅图：
